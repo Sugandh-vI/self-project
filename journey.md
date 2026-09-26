@@ -102,3 +102,69 @@ Each entry should cover:
 - After approval: provision Supabase Postgres → `prisma migrate dev` → `lib/prisma.ts`
   singleton → NextAuth Google auth + onboarding (username) → search UI with category tabs →
   post creation → feed.
+
+---
+
+## [Date: 27/09/2026] — Franchise-group matching design (awaiting user sign-off)
+
+### What was worked on
+- User **approved the schema as-is** (all 7 flagged decisions confirmed: Int rating, one Post
+  per (user, entry), franchise ref on Entry, seasonNumber+seasonLabel, no FeedEvent model,
+  pending/accepted friendship, nullable unique username).
+- Per the user's follow-up, designed the **franchise-group matching logic** for TV (TMDb) and
+  anime (AniList) and presented it for sign-off. **Nothing has been wired into code** — the
+  user explicitly wants to approve the anime approach before it is built.
+
+### Design summary (full detail presented in chat)
+- **TV (TMDb):** `/search/tv` returns shows (parent IDs). Group key = `tmdb:{showId}`,
+  entry key = `tmdb:{showId}:s{seasonNumber}`. No relation walking. Spin-offs/remakes are
+  separate TMDb IDs → separate groups.
+- **Anime (AniList):** season/cour entries are separate media IDs linked only via the
+  `relations` field. Matching = **PREQUEL-chain walk to the root media** (deterministic
+  tie-break: earliest air date, then lowest media ID; visited-set + max depth 10). Group key
+  = `anilist:{rootMediaId}`, entry key = `anilist:{mediaId}`. Relations are cached in our DB
+  (new `AniListRelation` model) so walks are local after first pass. Season numbers parsed
+  from title text ("Season 2", "2nd Season", "Part 2", "Cour 2", "2期"), fallback null;
+  entries ordered by seasonNumber → air date → title. AniList `format` MOVIE/MUSIC →
+  standalone (no group), per README "movies are standalone".
+
+### Schema delta requested (needs explicit sign-off — schema was approved as-is)
+1. `FranchiseGroup.sourceKey String? @unique` — deterministic group key
+   (`tmdb:1396`, `anilist:1210`); avoids name-collision bugs ("The Office" US vs UK) and makes
+   group upserts idempotent under concurrency.
+2. `Entry.entryKey String? @unique` — deterministic entry key (`tmdb:{show}:s{n}`,
+   `anilist:{mediaId}`, `tmdb:movie:{id}`). Needed because the existing
+   `@@unique([titleId, franchiseGroupId, seasonNumber, seasonLabel])` cannot dedup NULLs
+   (Postgres treats NULLs as distinct) — without it, two users posting the same anime season
+   create two Entries, which breaks the one-grouped-card rendering and can bypass the
+   `(userId, entryId)` Post uniqueness.
+3. `model AniListRelation` — cached AniList relation edges (`fromTitleId`, `toSourceId`,
+   `relationType`) so the root walk doesn't hit AniList on every render (rate limits).
+
+### Open decisions presented to the user (recommendations in parentheses)
+1. Anime MOVIE/MUSIC → standalone vs grouped? (standalone)
+2. Anime SPECIAL/OVA → grouped with seasonLabel vs standalone? (grouped — README lists OVAs)
+3. Continuation chains (Naruto → Shippuden → Boruto) → one group per chain root vs split per
+   show? (one group per root)
+4. Multiple-prequel branches (Fate routes) → tie-break by earliest air date vs lowest media
+   ID? (earliest air date)
+5. User override at post time (reassign entry to another group / make standalone) — in MVP or
+   deferred? (recommend deferring to keep MVP scope)
+6. Approve the 3-item schema delta above.
+
+### Environment notes / blockers
+- **The sandbox was rebuilt from the git snapshot between sessions:** `node_modules` and the
+  gitignored `.env` did not survive, and the local branch had been reset to `a7f445c`.
+  Restored via `git fetch origin arena/01a0dee7-self-project` + `git reset --hard FETCH_HEAD`
+  → local branch back at the scaffold commit `5133666`, working tree clean.
+- **`.env` is missing in this environment** — user stated `DATABASE_URL` (Supabase) and Google
+  OAuth credentials are in `.env`, but the file is not present here (gitignored files don't
+  persist across sandbox snapshots). User must restore it before provisioning/migrate.
+- Sandbox network still blocks `ui.shadcn.com` and `binaries.prisma.sh` (unchanged).
+
+### What should happen next
+- Wait for user sign-off on the anime matching approach + the schema delta.
+- Then: restore `.env` + `npm install` → verify Supabase connectivity → `prisma migrate dev`
+  (including the delta) → `lib/prisma.ts` singleton → NextAuth Google login + username
+  onboarding → category-tab search (local cache first, TMDb/AniList fallback) → post creation.
+- **Standing gate: stop and check in before starting friends/feed logic.**
