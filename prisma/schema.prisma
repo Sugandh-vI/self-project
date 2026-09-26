@@ -105,7 +105,8 @@ model Title {
   sourceId  String // the title's ID in the source API
   createdAt DateTime @default(now())
 
-  entries Entry[]
+  entries          Entry[]
+  aniListRelations AniListRelation[]
 
   @@unique([source, sourceId]) // cache dedup: same title from same source is stored once
 }
@@ -114,6 +115,7 @@ model FranchiseGroup {
   id        String   @id @default(cuid())
   name      String
   category  Category // tv or anime only — movies never get a franchise group (README Section 5)
+  sourceKey String?  @unique // deterministic matching key: "tmdb:{showId}" | "anilist:{rootMediaId}" — upsert target for franchise grouping
   createdAt DateTime @default(now())
 
   entries Entry[]
@@ -125,11 +127,29 @@ model Entry {
   franchiseGroupId String? // null for standalone movies; set for TV/anime seasons, cours, OVAs, etc. (README Section 5)
   seasonNumber     Int? // season/course number when applicable
   seasonLabel      String? // free-text label when a number doesn't fit (e.g. "OVA", "Final Season")
+  entryKey         String?  @unique // deterministic entry key: "tmdb:{showId}:s{n}" | "anilist:{mediaId}" | "tmdb:movie:{id}" — dedups entries across users (Postgres unique ignores NULLs, so the composite key above can't do this)
   createdAt        DateTime @default(now())
 
   title          Title           @relation(fields: [titleId], references: [id], onDelete: Restrict)
   franchiseGroup FranchiseGroup? @relation(fields: [franchiseGroupId], references: [id], onDelete: Restrict)
   posts          Post[]
+}
+
+// Cached AniList relation edges (README Section 7 caching requirement).
+// Lets the anime franchise root-walk run entirely against local data instead
+// of calling AniList on every render. toSourceId may reference a media that is
+// not cached as a Title yet (resolved lazily during the walk).
+model AniListRelation {
+  id           String   @id @default(cuid())
+  fromTitleId  String
+  toSourceId   String // AniList media ID of the related title
+  relationType String // AniList MediaRelation: SEQUEL | PREQUEL | SIDE_STORY | SUMMARY | PARENT | ADAPTATION | ...
+  createdAt    DateTime @default(now())
+
+  fromTitle Title @relation(fields: [fromTitleId], references: [id], onDelete: Cascade)
+
+  @@unique([fromTitleId, toSourceId, relationType])
+  @@index([fromTitleId])
 }
 
 // ---------------------------------------------------------------------------
