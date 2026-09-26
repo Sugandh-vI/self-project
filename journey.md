@@ -272,3 +272,90 @@ Prisma would generate for the current schema (standard Prisma DDL conventions),
 apply it over the connection string with `pg`, and record the row in
 `_prisma_migrations` with the correct sha256 checksum so `prisma migrate dev`
 on the user's machine sees an up-to-date database.
+
+---
+
+## [Date: 27/09/2026] — Credentials received; migration SQL written + validated; live verification blocked by sandbox egress
+
+### What was worked on
+- Received all four credentials (DATABASE_URL, GOOGLE_CLIENT_ID/SECRET,
+  NEXTAUTH_SECRET, TMDB_API_KEY). Wrote them into the local gitignored `.env`.
+  Used the user's NEXTAUTH_SECRET as-is (no need to generate a new one).
+- Attempted the DB-dependent pipeline steps. **None of the live steps could
+  run from this sandbox** — see egress findings below.
+
+### Egress findings (why live verification is impossible here)
+- **Supabase direct host is IPv6-only** (`db.<ref>.supabase.co` has no A
+  record; sandbox has no IPv6 route → ENETUNREACH).
+- **Supabase pooler hosts (IPv4) accept TCP but the proxy kills the
+  Postgres session** ("Connection terminated unexpectedly"). Same for a
+  control test against example.com:80 — the sandbox egress proxy allowlists
+  npm registry + GitHub and drops everything else.
+- **TMDb and AniList are TLS-blocked** (same class of failure).
+- Conclusion: migrations, connectivity checks, Google login, and TMDb/AniList
+  verification must happen on the user's machine. Nothing in the repo depends
+  on the sandbox.
+
+### What was completed (verifiable without the external services)
+- **Initial migration hand-written** at
+  `prisma/migrations/20260927090000_init/migration.sql`, following Prisma's
+  exact DDL conventions (enum types, `Table_col_fkey` / `Table_col_key` /
+  `Table_col_idx` naming, ON DELETE per relation, `ON UPDATE CASCADE`).
+  Because the user applies it with `prisma migrate deploy`, Prisma records the
+  `_prisma_migrations` row (and checksum) itself — no hand-inserted row needed.
+- **Migration SQL validated against a real Postgres engine** (PGlite, WASM
+  build installed from npm): applies cleanly; introspection confirms 11
+  tables, 3 enums with correct values, 26 indexes (11 pkeys + 15 secondary,
+  all named as Prisma would), 11 FKs with the intended ON DELETE actions
+  (Cascade for user-owned rows, Restrict for Title/Entry), and correct column
+  types/defaults (e.g. `Post.updatedAt` NOT NULL without default,
+  `User.isPrivate` DEFAULT false, `Entry.entryKey`/`FranchiseGroup.sourceKey`
+  nullable + unique).
+- **`scripts/verify-e2e.mjs`** (+ `npm run verify:e2e`): local verification
+  harness the user runs after migrating. Seeds a throwaway user + session row
+  directly in the DB (no Google login needed), then exercises the real API
+  routes: cache-first search (TV/movie/anime), post creation, franchise
+  grouping for a real multi-season TV show and a real multi-season anime
+  (root walk), movie standalone behavior, re-rate-in-place, new-season-new-
+  post, and no-duplicate caching. Cleans up its user/session/posts; cache rows
+  are intentionally kept. `pg` added as a devDependency for this.
+- `tsc`, `eslint`, `next build` all pass; script syntax-checked.
+
+### Decisions / notes
+- NEXTAUTH_SECRET: used the value the user provided (they offered to let me
+  generate one; theirs is fine and avoids extra churn across .env + Vercel).
+- **Credential handling for the record:** the four dev credentials live only
+  in the gitignored local `.env` (never committed) and in this chat's history.
+  They are dev-only and must be rotated before launch (see TODO below). The
+  sandbox does not persist `.env`; the user re-adds it each session by
+  agreement.
+
+### TODO — ROTATE BEFORE LAUNCH (still open)
+- Google OAuth client secret, Supabase DB password, and NEXTAUTH_SECRET are
+  dev-only and exposed in chat history. Rotate all three before real users:
+  new Google OAuth client, Supabase password reset, new NEXTAUTH_SECRET (and
+  update `.env` + Vercel env vars).
+
+### Exact local verification steps for the user (migration history)
+1. `npx prisma migrate status` — expect: 1 migration found,
+   `20260927090000_init` not yet applied.
+2. `npx prisma migrate deploy` — applies the SQL and records the history row.
+3. `npx prisma migrate status` — expect: "Database schema is up to date."
+4. `npx prisma migrate dev` — the drift check: expect "Already in sync, no
+   schema changes or pending changes found." If it instead wants to generate a
+   new migration, the hand-written SQL drifted from the schema — report back.
+   (If the machine has no IPv6, use the Supabase **Session pooler** string
+   from Settings → Database → Connection pooling: username
+   `postgres.snjfaujdrokvjhhdpfog`, port 5432.)
+5. `npm run dev`, then in a second terminal `npm run verify:e2e` — runs the
+   full end-to-end checks (search/caching, franchise grouping, re-rate).
+6. Manual Google check: open http://localhost:3000/signin → Sign in with
+   Google → should land on /onboarding → pick a username → land on the
+   search page.
+
+### What should happen next
+- User runs the steps above and reports results (especially step 4's drift
+  check and the verify:e2e output).
+- Fix anything the verification surfaces.
+- **Standing gate: still no friends/feed logic started** — check in before
+  that work begins.
