@@ -168,3 +168,100 @@ Each entry should cover:
   (including the delta) → `lib/prisma.ts` singleton → NextAuth Google login + username
   onboarding → category-tab search (local cache first, TMDb/AniList fallback) → post creation.
 - **Standing gate: stop and check in before starting friends/feed logic.**
+
+---
+
+## [Date: 27/09/2026] — Schema delta applied; auth + search + post creation built (DB migration pending credentials)
+
+### What was worked on
+- Applied the approved 3-item schema delta and wired the first vertical slice:
+  NextAuth Google login + username onboarding, category-tab cache-first search,
+  and post creation with the approved franchise matching.
+- **DB-dependent steps (migrate + connectivity verification) are blocked on
+  credentials** — see env-var handling below.
+
+### What was completed
+- **Schema delta committed + pushed** (`0062162`): `FranchiseGroup.sourceKey`,
+  `Entry.entryKey`, new `AniListRelation` model (cached AniList relation edges),
+  `Title.aniListRelations` back-relation. Schema validated + client generated.
+- **`lib/prisma.ts`** singleton; **`lib/auth.ts`** (NextAuth v4 + Prisma adapter,
+  database sessions, session callback attaches `id`/`username`/`isPrivate`).
+- **`/signin`** (Google button) and **`/onboarding`** (username picker, 3–20
+  chars `[a-z0-9_]`, uniqueness via P2002 handling, server action).
+- **Category-tab search**: `/api/search` searches local Postgres cache first
+  (≥3 cached hits short-circuits the external call), falls back to TMDb
+  (movie/TV) or AniList (anime), caches new titles + AniList relation edges.
+  Client: debounced (300ms) TanStack Query, three tabs, poster grid.
+- **`lib/franchise.ts`** implements the approved matching: TV via TMDb parent
+  show id; anime via PREQUEL-chain root walk (earliest-air-date tie-break,
+  then lowest media id; visited-set + depth cap 10); MOVIE/MUSIC standalone;
+  season numbers parsed from title text; `seasonLabel` derived when no number.
+- **`/api/posts`** (one post per user+entry, re-rate updates in place),
+  **`/api/titles/[id]/seasons`** (TV season picker), post-creation dialog with
+  0–10 rating picker + optional caption + poster fallback card.
+- `next.config.ts`: remote image patterns for `image.tmdb.org` / AniList hosts.
+- `tsc --noEmit`, `eslint`, and `next build` all pass (build run with
+  placeholder env values since real ones aren't in the sandbox yet).
+
+### Decisions from this session (all approved by user)
+1. Anime MOVIE/MUSIC → standalone (no franchise group).
+2. Anime SPECIAL/OVA → grouped with `seasonLabel`.
+3. Continuation chains (Naruto → Shippuden → Boruto) → one group per chain root.
+4. Multiple-prequel branches → tie-break by earliest air date, then lowest
+   media id (fresh AniList metadata fetched only in this rare branch).
+5. Post-time user override → **deferred to post-MVP**.
+6. Schema delta (sourceKey / entryKey / AniListRelation) → applied.
+
+### Known limitations (documented, not silently accepted)
+- **No manual franchise override (decision #5).** If the auto-grouping walk
+  misclassifies an entry (wrong root, over-merged chain, missed side story),
+  there is currently **no user-facing fix** — the entry stays in the wrong
+  group until the override feature ships. Mitigation ideas for later: allow
+  reassigning an entry's `franchiseGroupId` / nulling it.
+- The anime root walk needs relation data; if AniList is unreachable at post
+  time and the media was never cached with relations, the entry may land in a
+  group of its own (graceful degradation, visible only as odd grouping).
+
+### Environment / credential handling (READ THIS BEFORE ASSUMING ANYTHING)
+- **`.env` never persists in the sandbox and is never pushed to GitHub** —
+  intentional by agreement. The user re-adds it locally each session.
+- **The sandbox resets between turns**: `node_modules` is wiped and the local
+  git branch is reset to the branch point (`a7f445c`). **Session-start routine:
+  `git fetch origin arena/01a0dee7-self-project && git reset --mixed FETCH_HEAD`
+  (working tree survives), then `npm install --ignore-scripts`** (plain
+  `npm install` fails here because `binaries.prisma.sh` is blocked and
+  `postinstall: prisma generate` can't download engines; run
+  `PRISMA_SCHEMA_ENGINE_BINARY=/bin/true PRISMA_QUERY_ENGINE_LIBRARY=/bin/true
+  PRISMA_QUERY_ENGINE_BINARY=/bin/true npx prisma generate` manually).
+  A mid-turn reset also happened once this session — same recovery applied.
+- **Env-var protocol (user's instruction):** there is no secrets panel in the
+  sandbox. When a step needs a specific credential, ask for exactly that one
+  and why; the user pastes the value into chat. Do NOT ask for the whole
+  `.env` upfront. This is a deliberate workflow, not an oversight.
+- **TODO — ROTATE BEFORE LAUNCH:** the Google OAuth client secret, Supabase
+  database password, and `NEXTAUTH_SECRET` currently in use are **dev-only**
+  and are sitting in this chat's history. They must all be rotated before any
+  real user touches the app. (Google: new OAuth client; Supabase: reset the DB
+  password; NEXTAUTH_SECRET: regenerate + invalidate sessions.)
+- Vercel project is live at `https://outoften-bay.vercel.app` and connected to
+  the repo, but only holds dummy env values for now — expected at this stage,
+  not a bug to fix.
+
+### What should happen next
+1. Get `DATABASE_URL` from the user → verify Supabase connectivity → run the
+   initial migration (see blocker note below) → confirm tables exist.
+2. Get `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `NEXTAUTH_SECRET` →
+   end-to-end auth + onboarding verification.
+3. Get `TMDB_API_KEY` → verify movie/TV search + caching (AniList needs no key
+   and can be verified immediately).
+4. Then verify post creation end-to-end (including anime franchise grouping).
+5. **Standing gate: stop and check in before starting friends/feed logic.**
+
+### Blocker detail — migrations in this sandbox
+`prisma migrate dev` spawns the schema-engine binary from `binaries.prisma.sh`,
+which is network-blocked here, so the CLI cannot run migrations in this
+sandbox. Plan once `DATABASE_URL` arrives: hand-write the migration SQL that
+Prisma would generate for the current schema (standard Prisma DDL conventions),
+apply it over the connection string with `pg`, and record the row in
+`_prisma_migrations` with the correct sha256 checksum so `prisma migrate dev`
+on the user's machine sees an up-to-date database.
