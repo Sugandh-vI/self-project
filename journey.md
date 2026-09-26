@@ -234,6 +234,13 @@ Each entry should cover:
   `PRISMA_SCHEMA_ENGINE_BINARY=/bin/true PRISMA_QUERY_ENGINE_LIBRARY=/bin/true
   PRISMA_QUERY_ENGINE_BINARY=/bin/true npx prisma generate` manually).
   A mid-turn reset also happened once this session — same recovery applied.
+- **Sandbox egress is allowlist-based** (only npm registry + GitHub verified
+  reachable): `binaries.prisma.sh`, `ui.shadcn.com`, `api.themoviedb.org` and
+  `graphql.anilist.co` are all TLS-blocked from here. Consequence: code can be
+  written and compiled in the sandbox, but **live verification of migrations,
+  Supabase connectivity, TMDb and AniList must happen on a normal network**
+  (user's machine). Nothing in the repo depends on the sandbox — these are
+  environment limits, not code defects.
 - **Env-var protocol (user's instruction):** there is no secrets panel in the
   sandbox. When a step needs a specific credential, ask for exactly that one
   and why; the user pastes the value into chat. Do NOT ask for the whole
