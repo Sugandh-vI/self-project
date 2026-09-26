@@ -1,0 +1,181 @@
+// Prisma schema for the social movie/TV/anime rating app.
+// Data model implements README.md Section 11; behavior notes reference README sections.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum Category {
+  movie
+  tv
+  anime
+}
+
+enum Source {
+  tmdb // TMDb — movies + TV shows (README Section 7)
+  anilist // AniList — anime (README Section 7)
+}
+
+enum FriendshipStatus {
+  pending
+  accepted
+}
+
+// ---------------------------------------------------------------------------
+// Users & auth
+// NextAuth v4 + @next-auth/prisma-adapter: Account/Session/VerificationToken
+// are the adapter's expected tables; User holds our app-specific fields.
+// ---------------------------------------------------------------------------
+
+model User {
+  id            String    @id @default(cuid())
+  name          String? // display name from the Google account
+  email         String    @unique
+  emailVerified DateTime? // set by NextAuth on first Google login
+  image         String? // profile picture URL: Google photo by default, or Cloudinary upload (README Section 8)
+  username      String?   @unique // chosen during onboarding; null until onboarding is complete
+  isPrivate     Boolean   @default(false) // private profile/watch history (README Section 8)
+  createdAt     DateTime  @default(now())
+
+  accounts             Account[]
+  sessions             Session[]
+  posts                Post[]
+  comments             Comment[]
+  friendshipsRequested Friendship[] @relation("FriendshipRequester")
+  friendshipsReceived  Friendship[] @relation("FriendshipRecipient")
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ---------------------------------------------------------------------------
+// Content cache (README Section 7)
+// Titles looked up via TMDb/AniList are cached here and searched locally first.
+// Franchise/season grouping logic lives in our DB, not in the external APIs.
+// ---------------------------------------------------------------------------
+
+model Title {
+  id        String   @id @default(cuid())
+  name      String
+  category  Category // movie | tv | anime — determined by the search tab that found it (README Section 4)
+  posterUrl String? // null when the source API has no poster → placeholder card (README Section 3)
+  source    Source // tmdb | anilist
+  sourceId  String // the title's ID in the source API
+  createdAt DateTime @default(now())
+
+  entries Entry[]
+
+  @@unique([source, sourceId]) // cache dedup: same title from same source is stored once
+}
+
+model FranchiseGroup {
+  id        String   @id @default(cuid())
+  name      String
+  category  Category // tv or anime only — movies never get a franchise group (README Section 5)
+  createdAt DateTime @default(now())
+
+  entries Entry[]
+}
+
+model Entry {
+  id               String   @id @default(cuid())
+  titleId          String
+  franchiseGroupId String? // null for standalone movies; set for TV/anime seasons, cours, OVAs, etc. (README Section 5)
+  seasonNumber     Int? // season/course number when applicable
+  seasonLabel      String? // free-text label when a number doesn't fit (e.g. "OVA", "Final Season")
+  createdAt        DateTime @default(now())
+
+  title          Title           @relation(fields: [titleId], references: [id], onDelete: Restrict)
+  franchiseGroup FranchiseGroup? @relation(fields: [franchiseGroupId], references: [id], onDelete: Restrict)
+  posts          Post[]
+}
+
+// ---------------------------------------------------------------------------
+// Social layer
+// ---------------------------------------------------------------------------
+
+model Post {
+  id        String   @id @default(cuid())
+  userId    String
+  entryId   String
+  rating    Int // 0–10 (README Sections 1 & 11)
+  caption   String?
+  createdAt DateTime @default(now()) // feed ordering: adding a new season/entry creates a new Post, which bumps friends' feeds (README Section 5)
+  updatedAt DateTime @updatedAt // tracks re-ratings / caption edits
+
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  entry    Entry     @relation(fields: [entryId], references: [id], onDelete: Restrict)
+  comments Comment[]
+
+  @@unique([userId, entryId]) // one Post per user per entry — re-rating updates in place (see open questions)
+  @@index([createdAt])
+  @@index([userId])
+}
+
+model Comment {
+  id        String   @id @default(cuid())
+  postId    String
+  userId    String
+  text      String
+  createdAt DateTime @default(now())
+
+  post Post @relation(fields: [postId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([postId])
+}
+
+model Friendship {
+  id          String           @id @default(cuid())
+  requesterId String
+  recipientId String
+  status      FriendshipStatus @default(pending) // pending | accepted (README Section 11)
+  createdAt   DateTime         @default(now())
+
+  requester User @relation("FriendshipRequester", fields: [requesterId], references: [id], onDelete: Cascade)
+  recipient User @relation("FriendshipRecipient", fields: [recipientId], references: [id], onDelete: Cascade)
+
+  @@unique([requesterId, recipientId])
+}

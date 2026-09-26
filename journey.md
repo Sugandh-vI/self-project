@@ -26,3 +26,79 @@ Each entry should cover:
 - Next step: scaffold the Next.js project with the agreed stack (TypeScript, Tailwind,
   shadcn/ui, Prisma + Supabase Postgres, NextAuth with Google provider) and set up the initial
   Prisma schema based on the data model in README.md Section 11.
+
+---
+
+## [Date: 26/09/2026] — Scaffold + initial Prisma schema (awaiting schema approval)
+
+### What was worked on
+- Scaffolded the project per README Section 10 and wrote the initial Prisma schema per
+  Section 11. **Stopped at the mandatory checkpoint: schema posted for user approval, no
+  features/pages/logic built yet.**
+
+### What was completed
+- **Next.js 16.3.6** (App Router, React 19.2.8, TypeScript, Tailwind CSS v4, ESLint 9 flat
+  config) via `create-next-app`.
+- **shadcn/ui config** hand-written: `components.json` (new-york style, neutral base),
+  `lib/utils.ts` (`cn` helper), `app/globals.css` rewritten to the shadcn Tailwind v4 theme
+  (light + dark, oklch). No UI components added yet — registry unreachable from this sandbox
+  (see blockers). `npx shadcn add ...` will work once `ui.shadcn.com` is reachable.
+- **Prisma 6.19.3 + @prisma/client 6.19.3**; schema at `prisma/schema.prisma` implementing
+  README Section 11 (User, Account, Session, VerificationToken, Title, FranchiseGroup, Entry,
+  Post, Comment, Friendship + Category/Source/FriendshipStatus enums). Schema validated
+  (`prisma validate` ✓) and Prisma Client generated ✓.
+- **next-auth@4.24.15** (v4 stable) + **@next-auth/prisma-adapter@1.0.7** installed (no auth
+  code wired yet — that's post-approval).
+- **@tanstack/react-query@5** and **cloudinary** installed.
+- `.env.example` committed (DATABASE_URL, NEXTAUTH_SECRET/URL, GOOGLE_CLIENT_ID/SECRET,
+  CLOUDINARY_URL, TMDB_API_KEY, ANILIST_API_URL); local `.env` created and gitignored.
+- `postinstall: prisma generate` added to package.json.
+- `tsc --noEmit`, `next build`, and `eslint` all pass.
+
+### Decisions made during implementation (and why)
+1. **Prisma 6.19.3, not 7.x/8.x.** `prisma@latest` is an 8.0.0 release candidate with a
+   restructured CLI, and Prisma 7 removed `url = env("DATABASE_URL")` from schema files
+   (requires `prisma.config.ts` + driver adapters). README Section 10 explicitly favors
+   well-documented tooling to minimize agent mistakes → pinned to the classic, stable v6 line.
+2. **NextAuth v4 stable, not v5.** As of today `next-auth@latest` is 4.24.15; v5 is still
+   `beta` (5.0.0-beta.32). v4 + `@next-auth/prisma-adapter` is the stable pairing.
+3. **Self-hosted Geist font via the `geist` npm package** instead of `next/font/google` —
+   Google Fonts is unreachable from this sandbox (build was failing). The package uses the
+   same `--font-geist-sans` / `--font-geist-mono` CSS variables, so globals.css is unchanged.
+4. **Schema modeling decisions** (all flagged to the user for approval):
+   - `Post.rating` is `Int` (whole numbers 0–10) — README says "numeric 0–10" without
+     specifying halves.
+   - One Post per (user, entry) via `@@unique([userId, entryId])` — re-rating updates the
+     existing post (`updatedAt`) instead of creating a duplicate; feed bump happens only when
+     a NEW entry is posted, per README Section 5.
+   - Franchise reference lives on `Entry.franchiseGroupId` (README Section 11), not on Title
+     (Section 7's cached-fields wording suggests Title, but Section 11 is the explicit model).
+   - `Entry` carries both `seasonNumber Int?` and `seasonLabel String?` ("season number/label
+     if applicable" — number for seasons/cours, label for OVAs etc.).
+   - Feed is derived from `Post.createdAt` — no separate FeedEvent model (README: "Each Post
+     is what generates a feed event"; deep-link to the entry works via `Post.entryId`).
+   - `Friendship.status` = pending | accepted only (decline = delete the row, flagged as a
+     question).
+   - `User.username` nullable + unique (chosen during onboarding after first Google login).
+   - Deletion policy: user-owned rows cascade; Title/Entry use `Restrict` so cached content
+     can't silently delete posts.
+   - `Title` has `@@unique([source, sourceId])` so each cached title is stored once per source.
+
+### Known issues / blockers
+- **`binaries.prisma.sh` is blocked from this sandbox** → Prisma CLI can't download its
+  engines here. Workaround used: `PRISMA_SCHEMA_ENGINE_BINARY` / `PRISMA_QUERY_ENGINE_LIBRARY`
+  / `PRISMA_QUERY_ENGINE_BINARY` pointing at a dummy executable to skip download; `validate`,
+  `format`, and `generate` all succeeded. On a normal network (user machine / Vercel) engines
+  download automatically — no project change needed. Runtime DB queries still require the
+  real query engine binary.
+- **`ui.shadcn.com` is blocked from this sandbox** → shadcn components can't be added until
+  network access is available; config is in place so `npx shadcn add button` etc. will work.
+- No Supabase database provisioned yet — no migrations have been run.
+- Product name is still TBD (placeholder used in `app/layout.tsx` metadata).
+
+### What should happen next
+- **WAIT for explicit user approval of `prisma/schema.prisma`** (mandatory checkpoint — do not
+  build features until approved).
+- After approval: provision Supabase Postgres → `prisma migrate dev` → `lib/prisma.ts`
+  singleton → NextAuth Google auth + onboarding (username) → search UI with category tabs →
+  post creation → feed.
