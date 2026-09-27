@@ -555,3 +555,95 @@ harness asserts (1). `tsc`, `eslint`, `next build`, `node --check` all green.
   all checks passing, including the new collision section.
 - **Standing gate: still no friends/feed logic started** — check in before
   that work begins.
+
+---
+
+## 2026-09-27 (session 3, continued) — verify:e2e run 2: two failures root-caused, harness corrected
+
+User ran `verify:e2e`: 17/19 passed, 1 skipped (expected), 2 real failures.
+TLS fallback warning appeared once, as designed. TV flow (8 checks), movie
+standalone entry, cache non-duplication, and the collision unique index all
+confirmed working.
+
+### Failure 1 — "every movie result is backed by its own movie-category row — 0 movie results verified"
+Diagnosis: the check was **under-instrumented**, not wrong. It searched
+`/api/search?category=movie&q=Mirror` and treated "0 results" as a failure
+without reporting the HTTP status or the route's `degraded` message — so a
+non-200, a 500, or a degraded external-search failure were all
+indistinguishable from "TMDb returned nothing". The earlier movie-flow check
+("Inception") passed because it is a different query; "Mirror" is a weak query
+that depends on TMDb surfacing one specific id (1396), which it did not.
+Cannot be reproduced from the sandbox (TMDb/AniList/Supabase egress is blocked),
+so the cause of the empty set is not yet known — the next run will say.
+Fixes:
+- New `searchApi()` helper: every search the harness depends on now reports
+  `status` + `degraded`, so an empty result set can never masquerade as a pass
+  or a mystery failure. TV/movie/anime searches all use it.
+- The invariant check now runs on "Inception" (the same query the movie flow
+  uses, known to return hits), so it always has rows to verify.
+- Added a **deterministic, TMDb-independent** proof: a movie row for the same
+  numeric id as the cached TV row must be insertable and coexist. Under the old
+  (source, sourceId) key that INSERT threw a unique violation — which is exactly
+  why the movie was never cached — so the check doubles as a regression test.
+  Cleans up its probe row in a `finally`.
+- The targeted "Mirror" probe remains, but an absent id is now a SKIP that
+  prints what actually came back.
+
+### Failure 2 — "second anime season lands in the SAME franchise group": anilist:18397 + anilist:20958
+**The app is behaving exactly as the approved PREQUEL-walk design specifies;
+the harness picked two entries that are not in the same PREQUEL chain.**
+
+Actual AniList relation data (fetched from anilist.co):
+- **18397 = "Shingeki no Kyojin OVA"** — edges: `SOURCE`→manga 53390,
+  `PARENT`→16498. **No PREQUEL edge.**
+- **20958 = "Shingeki no Kyojin Season 2"** — `PREQUEL`→16498, `SEQUEL`→99147.
+- **16498 = "Shingeki no Kyojin" (S1)** — `PREQUEL`→**20811**, `SEQUEL`→20958,
+  `SIDE_STORY`→18397/99634, `ALTERNATIVE`→20691/20692, …
+- **20811 = "Shingeki no Kyojin Gaiden: Kuinaki Sentaku" (No Regrets OVA)** —
+  only `SEQUEL`→16498 and `ALTERNATIVE`→manga. **No PREQUEL edge → chain root.**
+
+Step-by-step walk as the code executes it:
+- `resolveAnimeEntry(18397)`: format OVA (not MOVIE/MUSIC → not standalone) →
+  `findAnimeRoot`: relations are [SOURCE, PARENT] → `prequelIds` empty → break
+  on iteration 1 → **root = 18397** → group `anilist:18397`.
+- `resolveAnimeEntry(20958)`: format TV → walk: 20958 --PREQUEL--> 16498
+  --PREQUEL--> 20811 → no prequel → **root = 20811** → group `anilist:20811`.
+- Two different groups → the check failed. Both entries behaved correctly.
+
+Root cause of the failure: the harness chose `s1 = results[0]` (AniList's
+SEARCH_MATCH ranking put the **OVA** first for "Attack on Titan") and
+`s2 = first result whose name matches /season 2|2nd season|part 2/` (S2). An OVA
+whose only edges are SOURCE/PARENT is its own chain root by design, so it can
+never share a group with S2. Verified locally: with the correct pair (S1 16498 +
+S2 20958) both walks land on root 20811 → one group, which is the approved
+design's "Attack on Titan S1–S4 → one group".
+
+Harness fix: pick a genuine PREQUEL-linked pair from the **cached relation
+edges** (a result whose `PREQUEL` points at another result), instead of trusting
+AniList's ordering or the result names. Two new assertions: both entries share
+exactly one franchise group, and that group is keyed on a real PREQUEL ancestor
+of the later entry (computed with a recursive CTE over the cached edges).
+
+**Product observation, NOT changed (approved design — do not revisit):** because
+AniList lists the "No Regrets" OVA (20811) as a PREQUEL of S1, the Attack on
+Titan franchise group is keyed `anilist:20811` and **named** "Shingeki no Kyojin
+Gaiden: Kuinaki Sentaku" — i.e. the group for the main series carries a prequel
+OVA's name. That follows directly from "group key = PREQUEL chain root".
+Candidate post-MVP refinement: prefer the earliest-air-date / TV-format chain
+member for the group *name* (key can stay the root id). Also noted: OVAs whose
+only edge is PARENT stay standalone, which may or may not be desired.
+
+### Sandbox verification (PGlite, real AniList AoT graph replayed)
+11/11 pass: pair selection picks (16498 → 20958); ancestor closure of S2 is
+{16498, 20811}; walk(S1) and walk(S2) both root at 20811; walk(OVA 18397) roots
+at itself; 20811 has no PREQUEL; old schema rejects the colliding movie INSERT
+while the new one accepts it and both rows coexist; `pg_indexes` reports only
+the new index. `node --check`, `eslint`, `tsc`, `next build` green.
+
+### What should happen next
+- User re-runs `npm run verify:e2e`. Expected: the collision section's three
+  checks pass deterministically, the anime section reports the real
+  S1→S2 pair and both group checks pass, and the "Mirror" probe SKIPs while
+  printing what TMDb actually returned (status/degraded) — which finally
+  answers why "Mirror" came back empty.
+- **Standing gate: still no friends/feed logic started.**

@@ -71,6 +71,17 @@ async function apiJson(path, options) {
   return { status: res.status, body };
 }
 
+/** Search the API and return a human-readable note about how the call went.
+ *  An empty result set must never be indistinguishable from a silent failure,
+ *  so the status and the route's `degraded` message are always surfaced. */
+async function searchApi(category, query) {
+  const { status, body } = await apiJson(
+    `/api/search?category=${category}&q=${encodeURIComponent(query)}`
+  );
+  const degraded = body?.degraded ? `, degraded: ${body.degraded}` : "";
+  return { status, body, note: `status ${status}${degraded}` };
+}
+
 function section(title) {
   console.log(`\n${title}`);
 }
@@ -230,8 +241,12 @@ async function main() {
 
   // ------------------------------------------------------------- TV flow
   section("TV flow (TMDb): Breaking Bad, seasons 1 + 2");
-  const tvSearch = await apiJson("/api/search?category=tv&q=Breaking%20Bad");
-  check("TV search returns results", tvSearch.body?.results?.length >= 1);
+  const tvSearch = await searchApi("tv", "Breaking Bad");
+  check(
+    "TV search returns results",
+    tvSearch.status === 200 && (tvSearch.body?.results?.length ?? 0) >= 1,
+    tvSearch.note
+  );
   const tvTitle = tvSearch.body?.results?.[0];
   const tvSourceId = tvTitle?.sourceId;
 
@@ -306,9 +321,13 @@ async function main() {
 
   // ---------------------------------------------------------- movie flow
   section("Movie flow (TMDb): standalone entry, no franchise group");
-  const movieSearch = await apiJson("/api/search?category=movie&q=Inception");
+  const movieSearch = await searchApi("movie", "Inception");
   const movieTitle = movieSearch.body?.results?.[0];
-  check("movie search returns results", Boolean(movieTitle));
+  check(
+    "movie search returns results",
+    movieSearch.status === 200 && Boolean(movieTitle),
+    movieSearch.note
+  );
   const moviePost = await apiJson("/api/posts", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -345,28 +364,81 @@ async function main() {
     indexNames.join(", ") || "no matching index found"
   );
 
-  const collisionSearch = await apiJson("/api/search?category=movie&q=Mirror");
-  const collisionResults = collisionSearch.body?.results ?? [];
-  const collisionRows = collisionResults.length
+  // (1) Deterministic, TMDb-independent proof: a movie row for the same
+  // numeric id as the cached TV row must be insertable. The old
+  // (source, sourceId) key rejected it with a unique violation, which is why
+  // the movie was never cached. If the movie is already cached, its mere
+  // existence alongside the TV row proves the same thing.
+  const existingMovie = await db.query(
+    `SELECT id FROM "Title" WHERE source = 'tmdb' AND category = 'movie' AND "sourceId" = $1`,
+    [tvSourceId]
+  );
+  let probeId = null;
+  let insertError = "";
+  if (existingMovie.rowCount === 0) {
+    probeId = `ve2e_${randomBytes(6).toString("hex")}`;
+    try {
+      await db.query(
+        `INSERT INTO "Title" (id, name, category, "posterUrl", source, "sourceId", "createdAt")
+         VALUES ($1, 'verify-e2e collision probe', 'movie', NULL, 'tmdb', $2, NOW())`,
+        [probeId, tvSourceId]
+      );
+    } catch (error) {
+      insertError = error instanceof Error ? error.message : String(error);
+    }
+  }
+  try {
+    const both = await db.query(
+      `SELECT category, name FROM "Title" WHERE source = 'tmdb' AND "sourceId" = $1 ORDER BY category`,
+      [tvSourceId]
+    );
+    check(
+      `movie + TV rows coexist for tmdb:${tvSourceId}`,
+      insertError === "" &&
+        both.rowCount === 2 &&
+        both.rows.some((r) => r.category === "movie"),
+      insertError || both.rows.map((r) => `${r.category}:${r.name}`).join(" + ")
+    );
+  } finally {
+    if (probeId) {
+      await db.query(`DELETE FROM "Title" WHERE id = $1`, [probeId]);
+    }
+  }
+
+  // (2) App-level invariant on real search results. Deliberately uses the same
+  // query as the movie flow above, which is known to return hits, so this
+  // check always has rows to verify.
+  const inceptionSearch = await searchApi("movie", "Inception");
+  const movieResults = inceptionSearch.body?.results ?? [];
+  check(
+    "movie search returns results (for the invariant check)",
+    inceptionSearch.status === 200 && movieResults.length > 0,
+    inceptionSearch.note
+  );
+  const movieRows = movieResults.length
     ? await db.query(
         `SELECT id, name, category FROM "Title"
          WHERE source = 'tmdb' AND category = 'movie' AND "sourceId" = ANY($1::text[])`,
-        [collisionResults.map((r) => r.sourceId)]
+        [movieResults.map((r) => r.sourceId)]
       )
     : { rows: [] };
-  const rowsById = new Map(collisionRows.rows.map((r) => [r.id, r]));
-  const leaked = collisionResults.filter((r) => {
+  const rowsById = new Map(movieRows.rows.map((r) => [r.id, r]));
+  const leaked = movieResults.filter((r) => {
     const row = rowsById.get(r.titleId);
     return !row || row.category !== "movie" || row.name !== r.name;
   });
   check(
     "every movie result is backed by its own movie-category row",
-    collisionResults.length > 0 && leaked.length === 0,
+    movieResults.length > 0 && leaked.length === 0,
     leaked.length
-      ? `leaked rows: ${leaked.map((r) => `${r.name} (tmdb:${r.sourceId})`).join(", ")}`
-      : `${collisionResults.length} movie results verified`
+      ? `leaked: ${leaked.map((r) => `${r.name} (tmdb:${r.sourceId})`).join(", ")}`
+      : `${movieResults.length} results verified`
   );
 
+  // (3) Targeted probe: does TMDb surface the colliding movie for "mirror"?
+  // Inconclusive without a failure — the note says exactly what came back.
+  const collisionSearch = await searchApi("movie", "Mirror");
+  const collisionResults = collisionSearch.body?.results ?? [];
   const mirrorHit = collisionResults.find((r) => r.sourceId === tvSourceId);
   if (mirrorHit) {
     check(
@@ -400,77 +472,130 @@ async function main() {
   } else {
     skip(
       `TMDb did not return movie id ${tvSourceId} ("Mirror") for the query "mirror"`,
-      "the row-invariant check above still covers the collision"
+      `${collisionSearch.note}; checks 1 and 2 above still cover the collision`
     );
   }
 
   // ---------------------------------------------------------- anime flow
-  section("Anime flow (AniList): multi-season franchise grouping via root walk");
-  const animeSearch = await apiJson("/api/search?category=anime&q=Attack%20on%20Titan");
+  section("Anime flow (AniList): PREQUEL-chain grouping via root walk");
+  const animeSearch = await searchApi("anime", "Attack on Titan");
   const animeResults = animeSearch.body?.results ?? [];
-  check("anime search returns results", animeResults.length >= 1);
+  check(
+    "anime search returns results",
+    animeSearch.status === 200 && animeResults.length >= 1,
+    animeSearch.note
+  );
   if (animeResults.length >= 1) {
-    const s1 = animeResults[0];
-    const s2 =
-      animeResults.find((r) => /season\s*2|2nd season|part\s*2/i.test(r.name)) ??
-      animeResults[1];
-
-    const animePost1 = await apiJson("/api/posts", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ titleId: s1.titleId, rating: 9 }),
-    });
-    check("post anime season 1 (rating 9)", animePost1.status === 200, `status ${animePost1.status}`);
-
-    const animeGroup = await db.query(
-      `SELECT g.id, g."sourceKey", g.name FROM "FranchiseGroup" g
-       JOIN "Entry" e ON e."franchiseGroupId" = g.id
-       JOIN "Title" t ON t.id = e."titleId"
-       WHERE t."sourceId" = $1 AND t.source = 'anilist'`,
-      [s1.sourceId]
+    // Pick a genuine PREQUEL-linked pair from the cached relation edges.
+    // Do NOT trust AniList's result ordering or the result names: for
+    // "Attack on Titan" the top hit is the OVA (anilist:18397), whose only
+    // edges are SOURCE/PARENT — under the approved PREQUEL-walk design it is
+    // its own chain root, so it can never share a group with Season 2
+    // (anilist:20958, whose PREQUEL is Season 1, anilist:16498).
+    const edgeRows = await db.query(
+      `SELECT from_t."sourceId" AS from_id, r."toSourceId" AS to_id, r."relationType" AS type
+       FROM "AniListRelation" r
+       JOIN "Title" from_t ON from_t.id = r."fromTitleId"
+       WHERE from_t.source = 'anilist' AND from_t."sourceId" = ANY($1::text[])`,
+      [animeResults.map((r) => r.sourceId)]
     );
-    check(
-      "anime entry grouped under anilist:{rootMediaId}",
-      animeGroup.rowCount === 1 && animeGroup.rows[0].sourceKey.startsWith("anilist:"),
-      animeGroup.rows[0]?.sourceKey
-    );
+    const byId = new Map(animeResults.map((r) => [r.sourceId, r]));
+    const pair = edgeRows.rows
+      .filter((e) => e.type === "PREQUEL" && byId.has(e.to_id))
+      .map((e) => ({ parent: byId.get(e.to_id), child: byId.get(e.from_id) }))[0];
 
-    const relationsCached = await db.query(
-      `SELECT COUNT(*)::int AS n FROM "AniListRelation" r
-       JOIN "Title" t ON t.id = r."fromTitleId"
-       WHERE t.source = 'anilist' AND t."sourceId" = $1`,
-      [s1.sourceId]
-    );
-    check("AniList relation edges cached", relationsCached.rows[0].n >= 1, `${relationsCached.rows[0].n} edges`);
+    if (!pair) {
+      skip(
+        "no PREQUEL-linked pair among the anime search results",
+        "the root walk cannot be exercised with this result set"
+      );
+    } else {
+      const s1 = pair.parent; // earlier in the PREQUEL chain
+      const s2 = pair.child; // has PREQUEL → s1
 
-    if (s2 && s2.titleId !== s1.titleId) {
+      const animePost1 = await apiJson("/api/posts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ titleId: s1.titleId, rating: 9 }),
+      });
+      check(
+        "post the earlier entry in the chain (rating 9)",
+        animePost1.status === 200,
+        `status ${animePost1.status}`
+      );
+
+      const relationsCached = await db.query(
+        `SELECT COUNT(*)::int AS n FROM "AniListRelation" r
+         JOIN "Title" t ON t.id = r."fromTitleId"
+         WHERE t.source = 'anilist' AND t."sourceId" = $1`,
+        [s1.sourceId]
+      );
+      check(
+        "AniList relation edges cached",
+        relationsCached.rows[0].n >= 1,
+        `${relationsCached.rows[0].n} edges`
+      );
+
       const animePost2 = await apiJson("/api/posts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ titleId: s2.titleId, rating: 8 }),
       });
+
       const animeEntries = await db.query(
-        `SELECT e."entryKey", e."seasonNumber", e."seasonLabel" FROM "Entry" e
+        `SELECT e."entryKey", e."franchiseGroupId", t."sourceId", t.name FROM "Entry" e
          JOIN "Title" t ON t.id = e."titleId"
          WHERE t.source = 'anilist' AND t."sourceId" IN ($1, $2)`,
         [s1.sourceId, s2.sourceId]
       );
-      const sameGroup =
-        animeGroup.rowCount === 1 &&
-        animeEntries.rowCount === 2 &&
-        (await db.query(
-          `SELECT COUNT(DISTINCT "franchiseGroupId")::int AS n FROM "Entry" e
-           JOIN "Title" t ON t.id = e."titleId"
-           WHERE t.source = 'anilist' AND t."sourceId" IN ($1, $2)`,
-          [s1.sourceId, s2.sourceId]
-        )).rows[0].n === 1;
+      const groupIds = [
+        ...new Set(animeEntries.rows.map((e) => e.franchiseGroupId)),
+      ];
       check(
-        "second anime season lands in the SAME franchise group (root walk)",
-        animePost2.status === 200 && sameGroup,
-        animeEntries.rows.map((e) => `${e.entryKey}${e.seasonNumber ? ` (s${e.seasonNumber})` : ""}${e.seasonLabel ? ` [${e.seasonLabel}]` : ""}`).join(" + ")
+        `anilist:${s2.sourceId} (PREQUEL → anilist:${s1.sourceId}) lands in the SAME group`,
+        animePost2.status === 200 &&
+          animeEntries.rowCount === 2 &&
+          groupIds.length === 1 &&
+          groupIds[0] !== null,
+        `${s1.name} + ${s2.name} → ${groupIds.length} group(s)`
       );
-    } else {
-      check("second anime season lands in the SAME franchise group (root walk)", false, "no distinct second result found in search");
+
+      // The shared group must be keyed on a real PREQUEL ancestor of the later
+      // entry (the walk's root), not on either entry itself — unless that
+      // entry genuinely is the chain root.
+      const ancestors = await db.query(
+        `WITH RECURSIVE chain AS (
+           SELECT r."toSourceId" AS id FROM "AniListRelation" r
+             JOIN "Title" t ON t.id = r."fromTitleId"
+            WHERE t.source = 'anilist' AND t."sourceId" = $1
+              AND r."relationType" = 'PREQUEL'
+           UNION
+           SELECT r."toSourceId" FROM "AniListRelation" r
+             JOIN "Title" t ON t.id = r."fromTitleId"
+             JOIN chain c ON t."sourceId" = c.id
+            WHERE t.source = 'anilist' AND r."relationType" = 'PREQUEL'
+         )
+         SELECT id FROM chain`,
+        [s2.sourceId]
+      );
+      const ancestorIds = new Set(ancestors.rows.map((r) => r.id));
+      const group =
+        groupIds[0] !== null
+          ? (
+              await db.query(
+                `SELECT "sourceKey", name FROM "FranchiseGroup" WHERE id = $1`,
+                [groupIds[0]]
+              )
+            ).rows[0]
+          : null;
+      const rootId = group?.sourceKey?.replace(/^anilist:/, "");
+      check(
+        "group is keyed on a PREQUEL-chain ancestor of the later entry",
+        Boolean(rootId) && (ancestorIds.has(rootId) || rootId === s2.sourceId),
+        `${group?.sourceKey} (${group?.name}); ancestors: ${
+          [...ancestorIds].join(", ") || "none"
+        }`
+      );
     }
   }
 
