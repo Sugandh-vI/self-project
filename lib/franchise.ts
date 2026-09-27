@@ -192,7 +192,11 @@ async function findAnimeRoot(
 
   const rootTitle = await prisma.title.findUniqueOrThrow({
     where: {
-      source_sourceId: { source: "anilist", sourceId: String(currentId) },
+      source_category_sourceId: {
+        source: "anilist",
+        category: "anime",
+        sourceId: String(currentId),
+      },
     },
   });
   return { id: currentId, name: rootTitle.name };

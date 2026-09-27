@@ -44,25 +44,34 @@ export async function searchTitles(
   }
 
   // 2) Cache is thin — fall back to the category-matched external source.
-  try {
-    if (category === "anime") {
-      const media = await searchAniList(q);
-      const titles = await Promise.all(media.map(upsertAniListTitle));
-      return { results: mergeResults(titles, cached) };
+  //    Only the external lookup may degrade gracefully: a database failure
+  //    here is a real error and must surface, not masquerade as "showing
+  //    cached results only" (that masking hid the Supabase pool exhaustion).
+  let fresh: Title[];
+  if (category === "anime") {
+    let media: AniListMedia[];
+    try {
+      media = await searchAniList(q);
+    } catch (error) {
+      return { results: cached.map(toResult), degraded: describe(error) };
     }
-    const hits = await searchTmdb(category, q);
-    const titles = await Promise.all(
+    fresh = await Promise.all(media.map(upsertAniListTitle));
+  } else {
+    let hits: Awaited<ReturnType<typeof searchTmdb>>;
+    try {
+      hits = await searchTmdb(category, q);
+    } catch (error) {
+      return { results: cached.map(toResult), degraded: describe(error) };
+    }
+    fresh = await Promise.all(
       hits.map((hit) => upsertTmdbTitle(category, hit))
     );
-    return { results: mergeResults(titles, cached) };
-  } catch (error) {
-    // External source unavailable (missing key, network, rate limit):
-    // degrade gracefully to whatever we have cached.
-    return {
-      results: cached.map(toResult),
-      degraded: error instanceof Error ? error.message : "Search failed.",
-    };
   }
+  return { results: mergeResults(fresh, cached) };
+}
+
+function describe(error: unknown): string {
+  return error instanceof Error ? error.message : "Search failed.";
 }
 
 function toResult(title: Title): TitleSearchResult {
@@ -91,7 +100,11 @@ export async function upsertTmdbTitle(
 ): Promise<Title> {
   return prisma.title.upsert({
     where: {
-      source_sourceId: { source: "tmdb", sourceId: hit.sourceId },
+      source_category_sourceId: {
+        source: "tmdb",
+        category,
+        sourceId: hit.sourceId,
+      },
     },
     create: {
       name: hit.name,
@@ -110,7 +123,11 @@ export async function upsertTmdbTitle(
 export async function upsertAniListTitle(media: AniListMedia): Promise<Title> {
   const title = await prisma.title.upsert({
     where: {
-      source_sourceId: { source: "anilist", sourceId: String(media.id) },
+      source_category_sourceId: {
+        source: "anilist",
+        category: "anime",
+        sourceId: String(media.id),
+      },
     },
     create: {
       name: pickAniListName(media),
@@ -149,7 +166,13 @@ export async function ensureAniListMediaCached(
   mediaId: number
 ): Promise<{ title: Title; relations: { relationType: string; nodeId: number }[] }> {
   const existing = await prisma.title.findUnique({
-    where: { source_sourceId: { source: "anilist", sourceId: String(mediaId) } },
+    where: {
+      source_category_sourceId: {
+        source: "anilist",
+        category: "anime",
+        sourceId: String(mediaId),
+      },
+    },
     include: { aniListRelations: true },
   });
   if (existing) {

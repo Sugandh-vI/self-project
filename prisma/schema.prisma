@@ -8,6 +8,11 @@ generator client {
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
+  // Migrations/DDL only (prisma migrate, db push, studio). Keeping them off
+  // the app's pooled connection stops migrate runs from consuming pooler
+  // client slots alongside the dev server. Never read at runtime — see
+  // .env.example for the recommended Supabase strings.
+  directUrl = env("DIRECT_URL")
 }
 
 // ---------------------------------------------------------------------------
@@ -108,7 +113,11 @@ model Title {
   entries          Entry[]
   aniListRelations AniListRelation[]
 
-  @@unique([source, sourceId]) // cache dedup: same title from same source is stored once
+  // Cache dedup. category MUST be part of the key: TMDb movie and TV IDs are
+  // separate namespaces that collide numerically (id 1396 is the movie
+  // "Mirror" *and* the TV show "Breaking Bad"), so a (source, sourceId) key
+  // made one tab's upsert silently return the other's cached row.
+  @@unique([source, category, sourceId])
 }
 
 model FranchiseGroup {

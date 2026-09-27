@@ -359,3 +359,108 @@ on the user's machine sees an up-to-date database.
 - Fix anything the verification surfaces.
 - **Standing gate: still no friends/feed logic started** — check in before
   that work begins.
+---
+
+## 2026-09-27 (session 3) — pool exhaustion root-caused + movie-search bug found and fixed
+
+### What the user verified locally (first real end-to-end pass)
+- Google login works (signed in as @lelouch_833), onboarding completes.
+- TV search ("dark") and Anime search ("one piece", "attack on titan") return
+  correct results; post creation succeeds (`POST /api/posts` 200); anime
+  franchise grouping renders correctly.
+- `prisma migrate deploy` applied the migration on their machine; the app runs
+  against the migrated DB.
+- Movie tab NOT yet confirmed — see the bug below.
+
+### Bug 1 (blocking) — intermittent EMAXCONNSESSION / P2024 / P1001
+Symptoms, verbatim from the user's terminal:
+- `FATAL: (EMAXCONNSESSION) max clients reached in session mode - max clients
+  are limited to pool_size: 15` on
+  `aws-0-ap-northeast-2.pooler.supabase.com:5432`
+- `Timed out fetching a new connection from the connection pool ... Current
+  connection pool timeout: 10, connection limit: 21` (Prisma P2024)
+- `Can't reach database server at aws-0-ap-northeast-2.pooler.supabase.com:5432`
+  (P1001)
+- Surfaced through next-auth's `getSessionAndUser` (401s on
+  `/api/auth/session`) and as "Showing cached results only. No results." on
+  search; re-triggering the same search then succeeded.
+
+Root cause (both halves confirmed):
+1. **Pool size vs pooler cap.** Prisma sizes its pool at `num_cpus * 2 + 1`
+   (21 on the user's 8-core machine); Supabase's session-mode pooler caps the
+   whole project at 15 client connections. Not a code leak — a default that is
+   simply too big for this database. One dev server alone could hit the cap;
+   cold Next.js route compilation or a second `next dev` made it reliable.
+2. **Masking.** The title-cache upserts sat *inside* searchTitles' try/catch,
+   so the pool error was reported to the user as a "degraded" external-search
+   failure with cached-only results. That is why it looked intermittent and
+   "search-related" rather than a connection problem.
+
+Fix (root cause, no retry/cache-fallback masking):
+- New `lib/prisma-pool.ts` — pins the runtime pool with an explicit
+  `connection_limit` on `DATABASE_URL` (default 5, overridable via
+  `PRISMA_CONNECTION_LIMIT`, and an explicit `?connection_limit=` in the URL
+  always wins). `lib/prisma.ts` passes it as `datasourceUrl`, so migrations
+  (which use `directUrl`) are unaffected.
+- `lib/titles.ts` — only the *external* lookup may degrade now; database
+  failures propagate as real errors instead of being relabelled "showing
+  cached results only".
+- `.env.example` documents both URLs and the reasoning (see below).
+
+directUrl decision: **yes, added** — `prisma/schema.prisma` now has
+`directUrl = env("DIRECT_URL")` so `prisma migrate`/`db push` run off the
+app's pooled connection. Note this makes `DIRECT_URL` **required** for all
+Prisma commands (`validate`/`generate`/`migrate` fail without it — verified
+locally with prisma 6.19.3), so it must exist in `.env` locally *and* in the
+Vercel project env before the next deploy builds.
+
+### Bug 2 (found while auditing the movie path) — TMDb movie/TV id collision
+`Title` had `@@unique([source, sourceId])`, but TMDb movie and TV IDs are
+independent sequences that collide numerically. TMDb staff, verbatim:
+"Entry number 1396 in the TV section is Breaking Bad and entry 1396 in the
+movie section is Mirror."
+Consequence: `upsertTmdbTitle`'s where-clause matched on (source, sourceId)
+only, so caching the movie found the cached TV row and returned it unchanged
+(`update: {}`) — the Movie tab displayed a TV show, the dialog then demanded a
+season, and the movie was never cached at all. Matches the reported
+"movie-search bug".
+Fix: `@@unique([source, category, sourceId])` + migration
+`20260927101500_title_source_category_unique` (pure index swap — the old key
+was stricter, so no existing row can violate the new one) + compound-key
+renames at the 4 call sites (`source_category_sourceId`).
+
+### Sandbox verification (PGlite, no live DB reachable from the sandbox)
+- Pool-cap rewriting: 6/6 checks pass (bare URL, existing params, explicit
+  limit wins, percent-encoded password preserved, env override, missing URL).
+- Migration applies on top of the init migration; movie 1396 ("Mirror") and tv
+  1396 ("Breaking Bad") now coexist, the TV row is untouched, and AniList
+  dedup is unchanged (one row per anilist sourceId).
+- Old schema reproduced for contrast: the movie upsert created nothing and the
+  Movie tab would have shown "Breaking Bad (tv)".
+- `tsc`, `eslint`, `next build` all pass after the changes.
+
+### Exact local verification steps for the user
+1. Edit `.env`: append the pool params to the existing session-pooler URL and
+   add DIRECT_URL (same host, no connection_limit):
+   `DATABASE_URL="...@aws-0-ap-northeast-2.pooler.supabase.com:5432/postgres?sslmode=require&connection_limit=5"`
+   `DIRECT_URL="...@aws-0-ap-northeast-2.pooler.supabase.com:5432/postgres?sslmode=require"`
+2. Kill any stray `next dev` processes (each holds its own pool).
+3. `npx prisma migrate status` — expect the new migration
+   `20260927101500_title_source_category_unique` listed as not yet applied.
+4. `npx prisma migrate deploy` — applies the index swap.
+5. `npx prisma migrate status` — "Database schema is up to date."
+6. `npx prisma migrate dev` — drift check: "Already in sync". (DIRECT_URL must
+   be set or every Prisma command errors.)
+7. `npm run dev` and re-run the searches that failed (Movie tab included,
+   several times in a row) — expect no EMAXCONNSESSION/P2024 and no
+   "Showing cached results only" banner.
+8. Movie-tab check for bug 2: search a title whose TMDb movie id collides with
+   a cached TV id (e.g. "mirror" after "breaking bad" has been searched on the
+   TV tab) — expect the actual movie, not the TV show.
+
+### What should happen next
+- User reports whether the pooling errors are gone and whether the movie tab
+  behaves; if the movie-search symptom was something *other* than the
+  collision above, describe it and it gets chased separately.
+- **Standing gate: still no friends/feed logic started** — check in before
+  that work begins.
