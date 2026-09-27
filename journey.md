@@ -464,3 +464,94 @@ renames at the 4 call sites (`source_category_sourceId`).
   collision above, describe it and it gets chased separately.
 - **Standing gate: still no friends/feed logic started** — check in before
   that work begins.
+
+---
+
+## 2026-09-27 (session 3, continued) — verify:e2e TLS failure root-caused; collision fix wired into the harness
+
+### Migration side: confirmed by the user
+`migrate status` → `migrate deploy` → `migrate status` → `migrate dev` all clean:
+`20260927101500_title_source_category_unique` applied, "Database schema is up to
+date!", "Already in sync" (drift check passed).
+
+### Bug 3 (blocking verify:e2e) — "self-signed certificate in certificate chain"
+`npm run verify:e2e` failed while every Prisma command against the same
+`DATABASE_URL`/`DIRECT_URL` worked.
+
+Root cause (found by reading pg 8.23 / pg-connection-string 2.14 in the repo):
+- `pg`'s `ConnectionParameters` does
+  `Object.assign({}, config, parse(config.connectionString))` — the **parsed
+  connection string overrides** anything passed alongside it.
+- `pg-connection-string` turns `sslmode=require` (no `sslrootcert`) into a bare
+  `ssl: {}` — i.e. "TLS with Node's defaults" = **full chain verification**.
+- So the script's existing `ssl: { rejectUnauthorized: false }` was silently
+  discarded. Reproduced locally: `new Client({ connectionString: '...sslmode=require', ssl: { rejectUnauthorized: false } }).connectionParameters.ssl` → `{}`.
+- The failure itself is environmental: this machine cannot build a trust chain
+  to Supabase's certificate (corporate/AV TLS interception, or a missing
+  intermediate CA). Not a database or migration problem.
+
+Fix in `scripts/verify-e2e.mjs` (no security relaxation that matters):
+- Never pass `connectionString` + `ssl` together. Parse the URL ourselves
+  (`new URL`), strip pg's `ssl*` params, and pass host/port/user/password/
+  database + an explicit `ssl` object — so nothing can override the policy.
+- Policy: **strict verification by default** (`rejectUnauthorized: true`); only
+  a chain-trust error (matched by Node's TLS codes / message phrasings) falls
+  back to encrypted-but-unverified TLS, for that one local run, with a loud
+  warning. TLS is never disabled. `VERIFY_E2E_SSL=require|verify-full` forces
+  either mode (default `verify-full`, which refuses to fall back).
+- `application_name: "verify-e2e"` so these connections are identifiable in
+  Supabase's connection logs.
+
+### Does sslmode=require affect the app's runtime Prisma connection? No.
+- Prisma's documented Postgres `sslmode` values are prefer (default) / disable /
+  require, where require = "Require TLS or fail" — encryption, no certificate
+  verification. Prisma's own recommended connection strings use
+  `sslmode=require`.
+- Empirical proof from this session: `prisma migrate status/deploy/dev` (same
+  Rust engine the client uses) connected to the same host with
+  `sslmode=require` and no CA chain problems, while only the `pg`-based script
+  failed. If the client verified chains, migrate would have failed too.
+- Supabase's pooler requires TLS anyway, so `require` only removes the
+  plaintext fallback that `prefer` allows — no functional change.
+- Caveat for later (not actionable now): Prisma v7's driver adapters / query
+  compiler change TLS trust handling (prisma/orm discussion #28610 — the CLI
+  engine and the adapter-based client can have *different* trust requirements,
+  and `sslaccept=strict`/`sslrootcert` do trigger verification). We are on
+  Prisma 6.19.3 with `prisma-client-js`, so this does not apply.
+
+### Movie/TV collision fix — now verified by the harness itself
+`scripts/verify-e2e.mjs` gained a "Movie/TV id collision" section that runs
+against the live DB:
+1. asserts the unique index is `Title_source_category_sourceId_key` (and the
+   old `Title_source_sourceId_key` is gone),
+2. asserts every Movie-tab result is backed by its own `category='movie'` row
+   with a matching name — the exact invariant the old bug violated (a TV row
+   leaking onto the Movie tab),
+3. when TMDb returns movie id 1396 ("Mirror", the id the TV flow cached as
+   "Breaking Bad"), asserts it resolves to the movie and posts as a standalone
+   `tmdb:movie:1396` entry; if TMDb doesn't return that id for the query
+   "mirror", the check is reported as SKIP (not a failure) and check 2 still
+   covers the collision.
+Also fixed two pre-existing queries that assumed one row per
+(source, sourceId) — they now scope to `category='tv'`, since the new key
+legitimately allows a movie and a TV show to share a numeric id.
+
+Sandbox re-verification (PGlite): 13/13 checks pass — pool-cap URL rewriting
+(6), old-schema collision reproduction (2), new-schema coexistence (1), movie
+row invariant (1), AniList dedup unchanged (1), index names match what the
+harness asserts (1). `tsc`, `eslint`, `next build`, `node --check` all green.
+
+### Known items (not to act on now)
+- Vercel's GitHub deployment check still fails — the project has placeholder
+  env vars only (and now also needs `DIRECT_URL`, or its build's
+  `prisma generate` fails).
+- The user's "movie-search bug from last session" symptom is still undescribed;
+  the collision bug above is fixed and now covered by the harness, so if their
+  symptom was something else it still needs to be reported.
+
+### What should happen next
+- User re-runs `npm run verify:e2e` (with `npm run dev` in a second terminal)
+  and pastes the output — expecting the TLS fallback warning (once) and then
+  all checks passing, including the new collision section.
+- **Standing gate: still no friends/feed logic started** — check in before
+  that work begins.

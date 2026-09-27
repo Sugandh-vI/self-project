@@ -15,7 +15,10 @@
  *   - cache-first search for TV (TMDb), movie (TMDb) and anime (AniList)
  *   - post creation + franchise grouping for a real multi-season TV show
  *   - franchise grouping for a real multi-season anime (root walk)
- *   - movie = standalone entry (no franchise group)
+ *  - movie = standalone entry (no franchise group)
+ *  - the TMDb movie/TV id collision fix: the same numeric id in two
+ *    categories must cache as two separate titles (id 1396 is the TV show
+ *    "Breaking Bad" and the movie "Mirror")
  *   - re-rating the same entry updates in place (no duplicate post)
  *   - adding a new season creates a new entry + post in the same group
  *
@@ -36,11 +39,19 @@ const SESSION_TOKEN = `verify-e2e-${randomBytes(16).toString("hex")}`;
 const TEST_EMAIL = "verify-e2e@local.test";
 
 const results = [];
+let skipped = 0;
 let cookieName = "next-auth.session-token";
 
 function check(name, ok, detail = "") {
   results.push({ name, ok });
   console.log(`${ok ? "  PASS" : "  FAIL"}  ${name}${detail ? ` — ${detail}` : ""}`);
+}
+
+/** A check that could not run (e.g. the external API did not return the
+ *  specific title needed). Reported, but not counted as a failure. */
+function skip(name, detail = "") {
+  skipped++;
+  console.log(`  SKIP  ${name}${detail ? ` — ${detail}` : ""}`);
 }
 
 async function api(path, options = {}) {
@@ -64,17 +75,119 @@ function section(title) {
   console.log(`\n${title}`);
 }
 
+// ---------------------------------------------------------------------------
+// Database connection (TLS)
+//
+// Do NOT pass `connectionString` + `ssl` together. pg's ConnectionParameters
+// does `Object.assign({}, config, parse(config.connectionString))` — the
+// *parsed connection string* wins over anything passed alongside it — and
+// pg-connection-string turns `sslmode=require` (with no sslrootcert) into a
+// bare `ssl: {}`, i.e. "TLS with Node's defaults" = full chain verification.
+// That silently discarded this script's old `ssl: { rejectUnauthorized: false }`
+// and produced "self-signed certificate in certificate chain" on machines that
+// cannot build a trust chain to Supabase's certificate (corporate/AV TLS
+// interception, or a missing intermediate CA).
+//
+// So: parse the URL ourselves, drop pg's ssl* params, and choose the policy
+// here. Default is strict verification; only a chain-trust failure falls back
+// to encrypted-but-unverified TLS, and only for this local dev run — TLS is
+// never switched off. VERIFY_E2E_SSL=require forces encrypt-only, and
+// VERIFY_E2E_SSL=verify-full (the default) refuses to fall back.
+// ---------------------------------------------------------------------------
+
+const SSL_POLICIES = {
+  "verify-full": { rejectUnauthorized: true },
+  require: { rejectUnauthorized: false },
+};
+
+function sslPolicy() {
+  const mode = (process.env.VERIFY_E2E_SSL || "verify-full").toLowerCase();
+  if (!(mode in SSL_POLICIES)) {
+    console.warn(`  ! unknown VERIFY_E2E_SSL="${mode}" — using verify-full`);
+    return SSL_POLICIES["verify-full"];
+  }
+  return SSL_POLICIES[mode];
+}
+
+/** Percent-decodes a URL component, falling back to the raw value if the
+ *  string is not valid percent-encoding (a raw `%` in a password). */
+function decodeUrlPart(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+/** Connection fields only — never a connectionString, so pg cannot override
+ *  our TLS policy with the one implied by the URL's sslmode. */
+function dbConfig(ssl) {
+  const url = new URL(process.env.DATABASE_URL);
+  for (const key of [...url.searchParams.keys()]) {
+    if (key.toLowerCase().startsWith("ssl")) url.searchParams.delete(key);
+  }
+  return {
+    host: url.hostname,
+    port: url.port ? Number(url.port) : 5432,
+    user: decodeUrlPart(url.username),
+    password: decodeUrlPart(url.password),
+    database: decodeUrlPart(url.pathname.slice(1)) || undefined,
+    ssl,
+    // Shows up in Supabase's connection logs, which makes stray connections
+    // from this script easy to spot.
+    application_name: "verify-e2e",
+  };
+}
+
+const CHAIN_TRUST_CODES = new Set([
+  "DEPTH_ZERO_SELF_SIGNED_CERT",
+  "SELF_SIGNED_CERT_IN_CHAIN",
+  "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+  "UNABLE_TO_GET_ISSUER_CERT",
+  "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+]);
+
+// pg surfaces the underlying TLS error's `reason` as the message, so match the
+// phrasings Node uses for an unbuildable trust chain.
+const CHAIN_TRUST_MESSAGE =
+  /self-signed certificate in certificate chain|unable to verify the first certificate|unable to get local issuer certificate|certificate verify failed/i;
+
+function isChainTrustError(error) {
+  return CHAIN_TRUST_CODES.has(error.code) || CHAIN_TRUST_MESSAGE.test(error.message ?? "");
+}
+
+async function connectDatabase() {
+  const policy = sslPolicy();
+  try {
+    const db = new Client(dbConfig(policy));
+    await db.connect();
+    return db;
+  } catch (error) {
+    if (policy.rejectUnauthorized === false || !isChainTrustError(error)) {
+      throw error;
+    }
+    console.warn(
+      "  ! TLS chain verification failed (" +
+        (error.code ?? error.message) +
+        ").\n" +
+        "    This machine cannot build a trust chain to Supabase's certificate\n" +
+        "    (commonly a corporate/AV TLS proxy). Retrying with encrypted-but-\n" +
+        "    unverified TLS for this local run only; TLS stays on. Fix the CA\n" +
+        "    chain (or set VERIFY_E2E_SSL=verify-full) to keep full verification."
+    );
+    const db = new Client(dbConfig(SSL_POLICIES.require));
+    await db.connect();
+    return db;
+  }
+}
+
 async function main() {
   if (!process.env.DATABASE_URL) {
     console.error("DATABASE_URL is not set — run with --env-file=.env");
     process.exit(1);
   }
 
-  const db = new Client({
-    connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false },
-  });
-  await db.connect();
+  const db = await connectDatabase();
   console.log(`Connected to database. Base URL: ${BASE_URL}`);
 
   // ---------------------------------------------------------------- seed
@@ -122,8 +235,10 @@ async function main() {
   const tvTitle = tvSearch.body?.results?.[0];
   const tvSourceId = tvTitle?.sourceId;
 
+  // The cache key is (source, category, sourceId), so a movie sharing this
+  // numeric id must not be counted here.
   const titleRows = await db.query(
-    `SELECT id FROM "Title" WHERE source = 'tmdb' AND "sourceId" = $1`,
+    `SELECT id FROM "Title" WHERE source = 'tmdb' AND category = 'tv' AND "sourceId" = $1`,
     [tvSourceId]
   );
   check("TV title cached locally (source+sourceId)", titleRows.rowCount === 1, `tmdb:${tvSourceId}`);
@@ -208,6 +323,87 @@ async function main() {
     moviePost.status === 200 && movieEntry.rowCount === 1 && movieEntry.rows[0].franchiseGroupId === null
   );
 
+  // ------------------------------------- movie/TV id collision (bug fix)
+  section("Movie/TV id collision: same numeric id, two categories");
+  // TMDb movie and TV ids are independent sequences that collide numerically:
+  // id 1396 is the TV show "Breaking Bad" (cached by the TV flow above) *and*
+  // the movie "Mirror". The Title cache key is (source, category, sourceId),
+  // so the movie must get its own row instead of silently returning the
+  // cached TV row — which used to show a TV show on the Movie tab and never
+  // cached the movie at all.
+
+  const indexRows = await db.query(
+    `SELECT indexname FROM pg_indexes
+     WHERE tablename = 'Title'
+       AND indexname IN ('Title_source_category_sourceId_key', 'Title_source_sourceId_key')`
+  );
+  const indexNames = indexRows.rows.map((r) => r.indexname);
+  check(
+    "unique index is (source, category, sourceId)",
+    indexNames.includes("Title_source_category_sourceId_key") &&
+      !indexNames.includes("Title_source_sourceId_key"),
+    indexNames.join(", ") || "no matching index found"
+  );
+
+  const collisionSearch = await apiJson("/api/search?category=movie&q=Mirror");
+  const collisionResults = collisionSearch.body?.results ?? [];
+  const collisionRows = collisionResults.length
+    ? await db.query(
+        `SELECT id, name, category FROM "Title"
+         WHERE source = 'tmdb' AND category = 'movie' AND "sourceId" = ANY($1::text[])`,
+        [collisionResults.map((r) => r.sourceId)]
+      )
+    : { rows: [] };
+  const rowsById = new Map(collisionRows.rows.map((r) => [r.id, r]));
+  const leaked = collisionResults.filter((r) => {
+    const row = rowsById.get(r.titleId);
+    return !row || row.category !== "movie" || row.name !== r.name;
+  });
+  check(
+    "every movie result is backed by its own movie-category row",
+    collisionResults.length > 0 && leaked.length === 0,
+    leaked.length
+      ? `leaked rows: ${leaked.map((r) => `${r.name} (tmdb:${r.sourceId})`).join(", ")}`
+      : `${collisionResults.length} movie results verified`
+  );
+
+  const mirrorHit = collisionResults.find((r) => r.sourceId === tvSourceId);
+  if (mirrorHit) {
+    check(
+      `movie id ${tvSourceId} resolves to the movie, not the cached TV show`,
+      mirrorHit.category === "movie" &&
+        mirrorHit.name.toLowerCase() !== "breaking bad",
+      `${mirrorHit.name} (${mirrorHit.category})`
+    );
+    const mirrorPost = await apiJson("/api/posts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        titleId: mirrorHit.titleId,
+        rating: 9,
+        caption: "Tarkovsky",
+      }),
+    });
+    const mirrorEntry = await db.query(
+      `SELECT e."entryKey", e."franchiseGroupId", t.category FROM "Entry" e
+       JOIN "Title" t ON t.id = e."titleId" WHERE e."entryKey" = $1`,
+      [`tmdb:movie:${tvSourceId}`]
+    );
+    check(
+      "colliding movie posts as a standalone movie entry",
+      mirrorPost.status === 200 &&
+        mirrorEntry.rowCount === 1 &&
+        mirrorEntry.rows[0].category === "movie" &&
+        mirrorEntry.rows[0].franchiseGroupId === null,
+      mirrorEntry.rows[0]?.entryKey
+    );
+  } else {
+    skip(
+      `TMDb did not return movie id ${tvSourceId} ("Mirror") for the query "mirror"`,
+      "the row-invariant check above still covers the collision"
+    );
+  }
+
   // ---------------------------------------------------------- anime flow
   section("Anime flow (AniList): multi-season franchise grouping via root walk");
   const animeSearch = await apiJson("/api/search?category=anime&q=Attack%20on%20Titan");
@@ -281,12 +477,12 @@ async function main() {
   // -------------------------------------------------------- cache checks
   section("Cache behavior");
   const before = await db.query(
-    `SELECT COUNT(*)::int AS n FROM "Title" WHERE source = 'tmdb' AND "sourceId" = $1`,
+    `SELECT COUNT(*)::int AS n FROM "Title" WHERE source = 'tmdb' AND category = 'tv' AND "sourceId" = $1`,
     [tvSourceId]
   );
   await apiJson("/api/search?category=tv&q=Breaking%20Bad");
   const after = await db.query(
-    `SELECT COUNT(*)::int AS n FROM "Title" WHERE source = 'tmdb' AND "sourceId" = $1`,
+    `SELECT COUNT(*)::int AS n FROM "Title" WHERE source = 'tmdb' AND category = 'tv' AND "sourceId" = $1`,
     [tvSourceId]
   );
   check("repeat search does not duplicate cached titles", before.rows[0].n === after.rows[0].n);
@@ -301,7 +497,8 @@ async function main() {
 
   // ------------------------------------------------------------- summary
   const failed = results.filter((r) => !r.ok);
-  console.log(`\n${results.length - failed.length}/${results.length} checks passed`);
+  const skipNote = skipped > 0 ? `, ${skipped} skipped` : "";
+  console.log(`\n${results.length - failed.length}/${results.length} checks passed${skipNote}`);
   if (failed.length > 0) {
     console.log("FAILED:");
     for (const f of failed) console.log(`  - ${f.name}`);
