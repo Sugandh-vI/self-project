@@ -647,3 +647,122 @@ the new index. `node --check`, `eslint`, `tsc`, `next build` green.
   printing what TMDb actually returned (status/degraded) — which finally
   answers why "Mirror" came back empty.
 - **Standing gate: still no friends/feed logic started.**
+
+---
+
+## 2026-09-27 (session 3, final) — all 23 e2e checks pass; session closed
+
+### Final verification (user, local machine, real Supabase database)
+`npm run verify:e2e`: **23/23 checks passed — 0 failures, 0 skips.**
+- TV flow 8/8: search, local cache, post creation, franchise group, season entries,
+  re-rate in place, new season = new entry in the same group.
+- Movie flow: standalone entry, no franchise group.
+- Movie/TV id collision 6/6: unique index shape, deterministic coexistence probe,
+  row invariant on real search results, targeted probe.
+- Anime PREQUEL-chain grouping: correct pair selected, correct chain root,
+  correct single-group result.
+- Cache behaviour: repeat search does not duplicate cached titles.
+- The TLS fallback warning printed once, as designed (this machine cannot build a
+  trust chain to Supabase's certificate).
+
+### Session arc (step-by-step detail lives in the three session-3 entries above)
+1. **Connection pool exhaustion — `EMAXCONNSESSION` / P2024 / P1001.** Root cause: Prisma
+   sizes its pool at `num_cpus * 2 + 1` (21 on the user's 8-core machine) while Supabase's
+   session-mode pooler caps the whole project at 15 client connections. Not a code leak —
+   single `PrismaClient` behind a correct `globalThis` singleton, no interactive transactions
+   — simply a default too large for this database. It surfaced through next-auth's
+   `getSessionAndUser` (401s) and as "Showing cached results only" on search because the
+   title-cache upserts sat inside the try/catch that was meant for external-API failures.
+   Fix: new `lib/prisma-pool.ts` pins an explicit `connection_limit` (default 5;
+   `PRISMA_CONNECTION_LIMIT` override; an explicit `?connection_limit=` in the URL always
+   wins) applied via `datasourceUrl`; `lib/titles.ts` now lets database failures propagate
+   instead of relabelling them as degraded searches.
+2. **`directUrl` / `DIRECT_URL`.** Added to the datasource so `prisma migrate` / `db push` run
+   off the app's pooled connection. Side effect (verified with prisma 6.19.3): `DIRECT_URL`
+   becomes **required** for every Prisma command, so it must exist locally and in the Vercel
+   project before the next deploy builds. No effect on the app's runtime connection — Prisma's
+   `sslmode=require` means "require TLS", not certificate verification, and `prisma migrate`
+   connected to the same host without issue while only the `pg`-based script failed.
+3. **Movie/TV id collision bug.** `Title` had `@@unique([source, sourceId])`, but TMDb movie and
+   TV ids are independent namespaces that collide numerically (TMDb staff, verbatim: "entry
+   number 1396 in the TV section is Breaking Bad and entry 1396 in the movie section is
+   Mirror"). A movie upsert therefore matched the cached TV row and returned it unchanged
+   (`update: {}`) — the Movie tab displayed a TV show, the post dialog then demanded a season,
+   and the movie was never cached at all. Fix: `@@unique([source, category, sourceId])` +
+   migration `20260927101500_title_source_category_unique` (a pure index swap — the old key was
+   stricter, so no existing row can violate the new one) + compound-key renames at the four
+   call sites (`source_category_sourceId`).
+4. **`verify-e2e.mjs` TLS failure.** `pg`'s `ConnectionParameters` does
+   `Object.assign({}, config, parse(config.connectionString))`, so the parsed connection string
+   overrides anything passed alongside it, and `pg-connection-string` maps `sslmode=require`
+   (with no `sslrootcert`) to a bare `ssl: {}` — i.e. TLS with Node's defaults = full chain
+   verification, which this machine cannot satisfy. The script's own
+   `ssl: { rejectUnauthorized: false }` was silently discarded. Fix: never pass a connection
+   string to `pg` — parse the URL ourselves, drop `ssl*` params, and set the policy explicitly:
+   strict verification by default, a narrow chain-trust-only fallback to encrypted-but-
+   unverified TLS for that local run (loud warning, TLS never disabled), and
+   `VERIFY_E2E_SSL=require|verify-full` to force a mode.
+5. **Anime-grouping harness bug — the product logic was correct all along.** The harness
+   compared `results[0]` against "the first result whose name matches a season regex".
+   AniList's `SEARCH_MATCH` ranking puts the Attack on Titan **OVA** (anilist:18397) first for
+   "Attack on Titan", and that OVA's only edges are `SOURCE`/`PARENT` — **no `PREQUEL`** — so
+   under the approved PREQUEL-walk design it is its own chain root and can never share a group
+   with Season 2 (anilist:20958). The app's walk was correct for both entries: 18397 → root
+   18397; 20958 → 16498 (S1) → 20811 (No Regrets OVA) → root 20811. Fix: select a genuine
+   PREQUEL-linked pair from the cached relation edges, and additionally assert the shared group
+   is keyed on a real PREQUEL ancestor of the later entry (recursive CTE over the cached edges).
+
+### Final status
+- **All 23 e2e checks pass** against the real Supabase database (user-verified this session).
+- Migration `20260927101500_title_source_category_unique` applied and verified
+  (`migrate status` → `migrate deploy` → `migrate status` → `migrate dev` drift check all clean).
+- `tsc`, `eslint`, `next build`, `node --check` green.
+- **No known open bugs.**
+- Vercel's deployment check still fails — expected, that project has placeholder env vars
+  only. It will also need `DIRECT_URL` added before the next real deploy builds.
+- Sandbox egress blocks TMDb / AniList / Supabase / prisma engine downloads, so live
+  verification has always been done on the user's machine, never in the sandbox.
+
+### Unresolved product decision — flagged, deliberately NOT acted on
+The Attack on Titan franchise group is keyed **and named** after its PREQUEL-chain root, which
+AniList happens to make the "No Regrets" prequel OVA (anilist:20811, "Shingeki no Kyojin Gaiden:
+Kuinaki Sentaku") rather than the mainline show. This follows directly from the approved design
+("group key = PREQUEL chain root"), so it was not changed. Post-MVP decision to make: keep the
+root id as the group *key* but name the group after its earliest TV-format / earliest-air-date
+entry instead. Related consequence of the same design: OVAs whose only edge is `PARENT` stay
+standalone rather than joining their parent series' group.
+
+### TODO — ROTATE BEFORE LAUNCH (still open, not forgotten)
+Google OAuth client secret, Supabase DB password, and `NEXTAUTH_SECRET` are dev-only and have
+been exposed in chat history. Rotate all three before real users: new Google OAuth client,
+Supabase password reset, new `NEXTAUTH_SECRET` (and update `.env` + Vercel env vars).
+Also still deferred to post-MVP and documented as a known limitation: the post-time user
+override for entry grouping (reassign an entry's group / make it standalone).
+
+---
+
+# What to do when this session resumes
+
+**Built and verified end-to-end for movies, TV and anime:** cache-first title search across all
+three category tabs (TMDb for movies/TV, AniList for anime), post creation with ratings and
+captions, franchise and season grouping (TMDb parent shows; AniList PREQUEL-chain root walk),
+re-rate-in-place, new-season-new-post, and the movie/TV id-collision-safe title cache. Google
+auth and onboarding work. The e2e harness (`npm run verify:e2e`) passes 23/23 against a real
+database.
+
+**Next milestone: friends and feed logic.** Nothing has been written for it — the standing gate
+has been respected throughout. Scope as designed:
+- **Friend requests:** send / accept (and reject), using the `Friendship` model already in the
+  schema.
+- **Profile visibility:** public/private, using the `User.isPrivate` flag already in the schema.
+- **Friend activity feed**, including the "new season = fresh feed event that bumps to the top"
+  behaviour designed earlier — re-rating an entry that already has a post must NOT bump it;
+  only a genuinely new entry does.
+
+**Before writing any code for that milestone:**
+1. Read this `journey.md` **in full** first. It is the authoritative record of every decision,
+   including the approved schema and the franchise-matching design review.
+2. Propose a design for the friends/feed **data model** (any schema delta beyond the existing
+   `Friendship` model) and the **API routes**, then get explicit sign-off before implementing —
+   the same pattern as the franchise-matching design review.
+3. Do not start friends/feed implementation until that sign-off lands.
