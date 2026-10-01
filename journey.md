@@ -1219,3 +1219,85 @@ Step 3: `lib/feed.ts` (grouping query + shared mapper), `GET /api/feed`, and `/f
 grouped franchise cards and snapshot pagination — then the Feed link joins the nav.
 Step 4: profile grid + carousel permalink + privacy states (this is what consumes
 `lib/visibility.ts`).
+
+---
+
+## 2026-10-01 (session 4, part 3) — drift incident: schema.prisma lost two `@@index` lines
+
+### Symptom (user's machine, real Supabase database)
+
+```
+npx prisma migrate status   → 3 migrations found, 20261001090000_friends_feed_indexes not yet applied
+npx prisma migrate deploy   → applied
+npx prisma migrate status   → "Database schema is up to date!"
+npx prisma migrate dev      → prompted "? Enter a name for the new migration:"
+```
+
+The user did **not** proceed — correct call, since letting it generate a migration would have
+applied unreviewed SQL to the real database.
+
+### Root cause — my bug, not Prisma's
+
+`schema.prisma` at `e8ac984` declared the Post composite index but **not** the two Friendship
+indexes, while the applied migration created all three. So the database had two indexes the
+schema didn't declare, and `migrate dev` wanted to generate a migration to **drop** them.
+
+How it happened: the sandbox reset mid-turn (documented behaviour — the local branch is reset to
+the branch point and tracked files revert), and it reverted part of `schema.prisma` *after* I had
+edited it. The two `edit_file` calls landed in the same message, but only the Post one survived
+into the commit. Everything else looked healthy, which is why the commit went out broken:
+- `tsc`, `eslint`, `next build` all pass — indexes are invisible to the type system;
+- the PGlite validation asserted the indexes exist **in the replayed SQL**, and they did. It
+  never compared the SQL against the schema, so it could not have caught this.
+
+Why `migrate status` still said "up to date": it only compares the migrations directory against
+`_prisma_migrations`. It never reads `schema.prisma`. Only `migrate dev` does — hence the two
+commands disagreeing. That asymmetry is worth remembering: **`migrate status` is not a drift
+check.**
+
+### Fix
+
+Restored the two declarations (`@@index([requesterId, status])`, `@@index([recipientId, status])`)
+directly under `@@unique([requesterId, recipientId])`, with a comment naming the migration they
+must stay in step with.
+
+**No new migration is needed and nothing changes in the database.** The SQL already created those
+indexes; `schema.prisma` was the side that was wrong. After pulling, `npx prisma migrate dev`
+should report "Already in sync, no schema changes or pending changes found" and create nothing.
+
+### New guard — `npm run verify:schema`
+
+`scripts/verify-schema-drift.mjs` reproduces Prisma's comparison offline: it replays every
+migration into PGlite and diffs the result against what `schema.prisma` actually declares —
+**every** index (name, table, columns, order) and **every** column (name + nullability) for all
+11 models. 28 indexes declared vs 28 built, all columns match → **39/39 pass**.
+
+Verified it catches the exact bug: deleting the two Friendship `@@index` lines makes it fail with
+`the migrations create it but schema.prisma does NOT declare it` for both (37 passed, 2 failed);
+restoring them returns 39/39.
+
+It needs `@electric-sql/pglite` (added to devDependencies — ~10 MB WASM, dev-only, nothing ships
+to the client). Worth it because migrations in this repo are hand-written: `prisma migrate dev`
+cannot run in the sandbox, since the schema engine is downloaded from `binaries.prisma.sh`, which
+is blocked. The user is otherwise the one who discovers drift, on a real database.
+
+Two parser notes, both of which produced false failures the first time and are now handled:
+schema comments are stripped before parsing (a comment containing the literal `@@index([userId])`
+read as a declaration), and relation/list fields are skipped when collecting columns.
+
+**Process change: run `npm run verify:schema` before every migration is handed over.** Asserting
+that SQL applies cleanly is not enough — the check has to be schema ↔ migration agreement.
+
+### Prisma version — explicitly NOT upgrading
+
+`migrate deploy` printed an update notice for `prisma@8.0.0-rc.19`. We are staying on the stable
+**6.19.3** line, unchanged from session 1's decision: 8.x is a release candidate with a
+restructured CLI, and Prisma 7+ removes `url = env("DATABASE_URL")` from schema files in favour of
+`prisma.config.ts` + driver adapters. The notice is informational and is not part of this fix.
+It can be silenced with `PRISMA_HIDE_UPDATE_MESSAGE=true` if it gets noisy.
+
+### State after this fix
+
+- 3 migrations, database up to date, no drift, no unapplied changes.
+- Friends layer from part 2 is unaffected (indexes are transparent to the code).
+- Local verification on the user's machine is still pending: `npm run verify:e2e`.

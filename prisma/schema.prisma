@@ -210,5 +210,14 @@ model Friendship {
   requester User @relation("FriendshipRequester", fields: [requesterId], references: [id], onDelete: Cascade)
   recipient User @relation("FriendshipRecipient", fields: [recipientId], references: [id], onDelete: Cascade)
 
+  // The unique above is directional, so it only serves "requests I sent".
+  // Both directions are queried on every page load (friend list, incoming
+  // requests, feed membership), hence one index per direction — each covering
+  // the status filter so pending and accepted rows are found without a scan.
+  // These MUST stay in step with
+  // prisma/migrations/20261001090000_friends_feed_indexes: an index the DB has
+  // but the schema doesn't declare reads as drift to `prisma migrate dev`.
   @@unique([requesterId, recipientId])
+  @@index([requesterId, status])
+  @@index([recipientId, status])
 }
