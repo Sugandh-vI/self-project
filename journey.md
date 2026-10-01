@@ -766,3 +766,241 @@ has been respected throughout. Scope as designed:
    `Friendship` model) and the **API routes**, then get explicit sign-off before implementing —
    the same pattern as the franchise-matching design review.
 3. Do not start friends/feed implementation until that sign-off lands.
+
+---
+
+## 2026-10-01 (session 4) — Friends + feed DESIGN (awaiting sign-off; no feature code written)
+
+Session branch: `arena/01a0f881-self-project`, branched off `main` at `4b73436` (main is at the
+tip, so this session starts from everything session 3 shipped). Standing gate respected:
+**no friends/feed code has been written.** This entry is the design review, mirroring the
+franchise-matching review from session 3.
+
+### 0. What already exists and is being reused (read before designing)
+
+- `Friendship { requesterId, recipientId, status: pending|accepted, createdAt }`,
+  `@@unique([requesterId, recipientId])`. **No indexes beyond that unique.**
+- `User.isPrivate Boolean @default(false)`, `User.username String? @unique`.
+- `Post` — one row per (user, entry) via `@@unique([userId, entryId])`; `createdAt @default(now())`,
+  `updatedAt @updatedAt`, indexes on `createdAt` and on `userId`.
+- `/api/posts` upserts: re-rating the same entry runs the **update** branch (`rating`, `caption`)
+  so `createdAt` is untouched, while a new entry runs the **create** branch so `createdAt` is now.
+  **The agreed bump semantics therefore already fall out of the existing write path** — ordering
+  the feed by `Post.createdAt` gives "new season bumps, re-rate doesn't" with zero extra logic.
+  This is the single most important finding of this review: it is why no `FeedEvent` model is
+  needed (see §2).
+
+### 1. Visibility model (one place, enforced server-side)
+
+New `lib/visibility.ts` is the **only** place that decides whether a viewer may see a profile's
+content. Every surface (profile page, `/api/feed`, and any future comments endpoint) calls it —
+never the UI on its own — so there is exactly one rule to audit.
+
+```ts
+type ViewerRelation = "self" | "friends" | "outgoing" | "incoming" | "none";
+relationOf(viewerId: string | null, targetId: string): Promise<ViewerRelation>
+canViewContent(relation: ViewerRelation, target: { isPrivate: boolean }): boolean
+//   self | friends            -> true
+//   outgoing | incoming|none  -> !target.isPrivate
+```
+
+- `self` — own profile, always full access.
+- `friends` — accepted friendship in **either** direction (single-row model, see §5).
+- `outgoing`/`incoming` — a pending request exists (drives "Request sent" / "Accept?" buttons).
+- `none` — stranger.
+- Anonymous (`viewerId === null`): every authed page already redirects to `/signin` via
+  `requireUser()`, so there is no logged-out surface. **Default: the whole app stays
+  authed-only for MVP** (no public/SEO profiles, no `robots` decisions yet).
+
+Locked (private, non-friend) profile renders: avatar, display name, `@username`, a private badge,
+and the request button/state. **No posts, no ratings, no captions, no counts.** The API returns
+`canView: false` and an empty post list — a locked profile leaks nothing over HTTP, not just in
+the DOM.
+
+### 2. Feed model — no new table
+
+**Decision: no `FeedEvent` / `FeedSeen` model.** Rationale, recorded so it isn't re-litigated:
+
+- README §11 says "Each Post is what generates a feed event" — the post *is* the event.
+- Bump-on-new-entry is already encoded in `Post.createdAt` by the existing upsert (§0).
+- Deep-linking into the correct slide of a grouped card needs only `Post.id` (§4).
+- An event log would only buy things we don't need yet: read/unread state, "bump on re-watch",
+  burst collapsing. If any of those become requirements, the migration is additive and easy.
+
+Feed query: `Post where userId IN (myAcceptedFriendIds) order by createdAt desc, id desc`.
+Pagination is **keyset on `(createdAt, id)`** (`id` breaks same-millisecond ties; `createdAt`
+alone is not unique). Cursor is an opaque base64url `{c: ISO createdAt, i: postId}`, so the
+client never sees or constructs ordering internals:
+
+```sql
+WHERE userId IN (...) AND (createdAt < c OR (createdAt = c AND id < i))
+ORDER BY createdAt DESC, id DESC LIMIT n
+```
+
+`friendIds` comes from one `findMany` with
+`OR: [{ requesterId: me, status: accepted }, { recipientId: me, status: accepted }]`.
+`IN` lists are fine at MVP scale; noted as the thing to replace with a join/raw SQL if a user
+ever has thousands of friends.
+
+Feed **excludes your own posts** by default — your posts live on your profile; the feed answers
+"what did my friends watch". Empty states: no friends → "Find friends" CTA; friends who haven't
+posted → "Nothing yet."
+
+### 3. Feed item shape (recommended: flat, one row per entry)
+
+```ts
+type FeedItem = {
+  postId: string;
+  createdAt: string;        // feed ordering key
+  updatedAt: string;        // > createdAt ⇒ the card can show "edited"
+  rating: number;           // 0–10
+  caption: string | null;
+  permalink: string;        // /u/{username}/p/{postId}
+  user:   { id, username, name, image };
+  title:  { id, name, posterUrl, category };
+  franchise: { id, name } | null;   // set when the entry belongs to a group
+  entry:  { id, seasonNumber, seasonLabel };
+};
+```
+
+One feed row = one watch event = one entry ("Breaking Bad — S2 · 9"), with the franchise name
+shown as context and the permalink landing on the grouped card **focused on that entry**. This
+keeps `orderBy createdAt` monotonic (a flat list of immutable timestamps), which is what makes
+keyset pagination correct: a grouped-card feed would have to order groups by `max(createdAt)`,
+which *moves* groups between pages and causes dupes/gaps. (See open decision Q1.)
+
+### 4. Profile pages and grouped posts
+
+- `/u/[username]` — server component, Prisma directly (no HTTP round trip, no second place
+  where privacy has to be enforced). Groups posts by `entry.franchiseGroupId ?? post.id`, i.e.
+  franchise entries collapse into one swipeable card and standalone movies stay single cards.
+  Groups ordered by **most recent post in the group, desc** (same notion of recency as the
+  feed); entries **within** a card ordered by `seasonNumber` asc (fallback `createdAt` asc) so a
+  card always reads in canonical watch order. Capped at 50 groups for MVP.
+- `/u/[username]/p/[postId]` — the canonical permalink, and the only route form we need. It
+  looks up the post, resolves its franchise group, and renders the grouped card with **that
+  entry focused** — exactly the README §5 "deep-link back to the correct entry/slide". A
+  standalone movie post renders as a one-slide card with the same component. Later, comments
+  attach to the Post, so this permalink doubles as the comment thread.
+- `/profile` — redirect to your own `/u/[username]`.
+- `/friends` — incoming requests (accept / decline), outgoing (cancel), friends list (unfriend),
+  and a user-search box to send new requests.
+
+Navigation: a shared client `<AppNav/>` (Search · Feed · Friends · @me) inside a new
+`app/(app)/` route group, so `/signin` and `/onboarding` stay chrome-free. This means moving
+`app/page.tsx` → `app/(app)/page.tsx` (URLs unchanged).
+
+### 5. Friend requests — behaviour on the existing `Friendship` row
+
+One row per pair, `requesterId` → `recipientId`. Lifecycle:
+
+| Action | Actor | Effect |
+|---|---|---|
+| Send | anyone (not self, target must exist) | create `pending`; if a pending row already exists **in the reverse direction**, flip it to `accepted` instead (auto-accept) |
+| Accept | recipient only | `status = accepted` |
+| Decline | recipient only | **delete the row** (no `rejected` status — see Q2/§7) |
+| Cancel | requester only | delete the row |
+| Unfriend | either side | delete the row |
+
+Consequences of "decline = delete", accepted knowingly: no memory of the rejection, so a
+declined user can re-request immediately (spam vector, tolerable at MVP scale), and there is no
+"request declined" notification (there is no notification system at all yet). If either becomes
+a problem the fix is additive: a `rejected` (or `blocked`) status plus `respondedAt`.
+
+Race: two concurrent sends in opposite directions can both insert (the unique constraint is
+directional, so it can't catch it). Mitigation in code: send runs in a transaction that
+re-checks both directions and catches P2002; accept additionally `deleteMany`s any reverse row.
+See Q4 for the alternative (canonical ordering of the pair) — recommendation is to **keep the
+current shape**, since requester/recipient is what accept/decline authorization reads naturally
+and the table is tiny.
+
+### 6. Proposed schema delta — indexes only, no new models
+
+1. `Friendship`: add `@@index([requesterId, status])` **and** `@@index([recipientId, status])`.
+   Today the only index is the unique `(requesterId, recipientId)`, which serves "requests I
+   sent" but *not* "requests sent to me" — every incoming-request lookup and every friend-list
+   query would seq-scan.
+2. `Post`: change `@@index([userId])` → `@@index([userId, createdAt])`. This is the exact shape
+   of both the feed query (`userId IN (...) ORDER BY createdAt DESC`) and the profile query, and
+   the composite still covers plain `userId` lookups as a prefix.
+
+Both are index-only — one migration, no data rewrite, no downtime, no backfill (the tables are
+effectively empty in dev).
+
+Explicitly **not** adding: `FeedEvent`, `Notification`, `Block`, `respondedAt`, per-post
+visibility, a canonical-pair `Friendship` reshape (unless Q4 says otherwise).
+
+### 7. API surface
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/api/users/search?q=` | authed only; username partial (case-insensitive) and exact-email match; ≤20 rows; returns id/username/name/image only |
+| GET | `/api/friends` | `{ friends, incoming, outgoing }` — drives `/friends` and the nav badge |
+| POST | `/api/friends/requests` | body `{ username \| email \| userId }` → `{ status: "pending" \| "accepted" }` |
+| POST | `/api/friends/requests/[id]/accept` | recipient only, else 403 |
+| DELETE | `/api/friends/[id]` | decline (recipient, pending) / cancel (requester, pending) / unfriend (either, accepted) |
+| GET | `/api/feed?cursor=&limit=` | `{ items: FeedItem[], nextCursor }` |
+| GET | `/api/users/[username]` | `{ user, viewerRelation, canView }` — profile summary for client bits; the page itself server-renders |
+
+Status codes: 400 self-request/bad body, 404 unknown user, 409 already-friends or
+request-already-sent, 403 wrong actor for accept/decline.
+
+New modules: `lib/friends.ts` (relation lookup, friend ids, send/accept/delete),
+`lib/visibility.ts` (§1), `lib/feed.ts` (feed query + the post→item mapper shared with profile
+pages so a post renders identically in both places).
+
+### 8. Verification plan (extends `scripts/verify-e2e.mjs`, no new harness)
+
+The harness currently seeds one throwaway user + session row; it grows to three (A, B, C) with
+distinct session tokens, and a new "Friends & feed" section runs against the live DB:
+
+1. A requests B → row `pending`; B sees it in `incoming`; A sees it in `outgoing`.
+2. B accepts → `accepted`; both now see each other in `friends`.
+3. Feed: B's feed contains A's posts; **C (stranger) sees none of them** (IDOR check).
+4. **Re-rate does not bump** — capture feed order, re-rate an older post, assert the order is
+   unchanged and `updatedAt > createdAt`.
+5. **New season does bump** — A posts S2, assert it is first in B's feed, and that its permalink
+   resolves to the franchise group with S2 focused.
+6. **Privacy** — set B `isPrivate`: C gets `canView: false` + no posts; A (friend) still sees
+   everything; `/u/b` renders the locked state for C.
+7. Reverse request auto-accepts (B requests A while A→B is pending → single accepted row).
+8. Unfriend → the ex-friend's posts disappear from the feed immediately.
+9. Cursor pagination — ≥25 posts across pages of 20: no overlap, no gaps, stable ordering.
+10. Self-request rejected; duplicate request → 409.
+
+### 9. Open decisions put to the user (recommendations in parentheses)
+
+- **Q1 Feed granularity** — flat one-row-per-entry (recommended) vs grouped franchise card per
+  user+franchise bumped by its newest entry. (Grouped breaks monotonic keyset pagination and
+  contradicts "each Post is a feed event".)
+- **Q2 Reverse pending request** — auto-accept (recommended) vs reject with 409.
+- **Q3 Friend discovery** — username partial **plus** exact-email lookup (recommended) vs
+  username only vs email only. Everyone signs in with Google, so email is the most reliable
+  identifier; exact-match-only keeps the enumeration risk small.
+- **Q4 Friendship row shape** — keep `requesterId`/`recipientId` with the invariant enforced in
+  code (recommended) vs canonical ordered pair `(userAId, userBId)` so Postgres rejects
+  duplicate/reverse rows at the DB level.
+
+Defaults I will apply unless told otherwise (flagged so they are easy to overturn):
+decline/cancel/unfriend = delete the row; feed excludes your own posts; the whole app stays
+authed-only; comments deferred (the `Comment` model exists, nothing reads it yet); profile
+groups ordered by most recent activity with entries in season order; no rate limiting on
+requests yet.
+
+### 10. Build order once signed off
+
+1. Migration for the two index changes → user runs `migrate deploy` + `migrate dev` drift check.
+2. `lib/friends.ts` + `lib/visibility.ts` + friend-request routes + `/friends` page + `(app)`
+   route group with nav.
+3. `lib/feed.ts` + `/api/feed` + `/feed` (TanStack `useInfiniteQuery`).
+4. Profile pages `/u/[username]` and `/u/[username]/p/[postId]` (grouped cards, privacy).
+5. Extend `verify-e2e.mjs` with §8's ten checks; user runs it locally; fix whatever surfaces.
+
+### 11. Carried-over TODOs (unchanged, still open)
+
+- **ROTATE BEFORE LAUNCH:** Google OAuth client secret, Supabase DB password, `NEXTAUTH_SECRET`
+  are dev-only and have been exposed in chat history.
+- `DIRECT_URL` must be added to the Vercel project env before the next real deploy builds.
+- Post-MVP: manual franchise override for entry grouping; consider naming a franchise group after
+  its earliest TV/air-date entry rather than its PREQUEL-chain root (Attack on Titan is currently
+  named after the "No Regrets" OVA).
