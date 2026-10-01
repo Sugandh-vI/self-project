@@ -1046,3 +1046,78 @@ serialised to the client is still fetched and typed through Prisma.
 
 Note: `FranchiseGroup` has no poster of its own (it has only `name` + `category`), so a tile's
 image comes from one of its entries' `Title.posterUrl` — see Q1b.
+
+### 13. Resolved design (user sign-off round, 2026-10-01)
+
+**Q1 — Layout: feed = swipeable cards, profile = tile grid.**
+- **`/feed`** scrolls vertically, one card per franchise group, carousel swipeable **inline**, so
+  the newest rating + caption are readable without tapping (Instagram's multi-image post).
+- **`/u/[username]`** is the square tile grid — tap a tile to open the full-screen carousel.
+- Both surfaces render the same underlying group; only the container differs. `lib/feed.ts`
+  exposes `getFeedGroups()` and `getProfileGroups()`, sharing one `groupPosts()` +
+  `mapGroupToCard()` so a franchise renders identically in both places.
+
+**Q2 — Tile number: the user's AVERAGE across the entries they rated in that group.**
+Chosen over my "latest rating" recommendation, and that is fine — but recorded with the tension
+it creates, because README §5 says a franchise is explicitly *not* one shared rating. The
+resolution: the average is a **display summary only**. The data keeps one `Post` per entry with
+its own rating/caption/timestamp, the carousel shows every entry's own rating, and the tile
+labels the number as an average rather than presenting it as "the" score:
+- tile badge = `avg 8.2` (one decimal, trailing `.0` dropped → `8`), plus an entry-count badge
+  when the group has more than one entry;
+- the **feed card headline still names the fresh activity**: "rated Season 3 · 9 · 2h ago" —
+  so the thing that bumped the card is always visible as its own number;
+- computed at read time, never stored (a stored average would go stale on every re-rate).
+If it ever reads as a franchise score rather than a summary, the fallback is Q2's "latest".
+
+**Q3 — Tile poster: the earliest entry's poster.** Group entries ordered by `seasonNumber` asc
+(fallback `createdAt` asc); tile uses the first one's `Title.posterUrl`, giving a stable
+"box set" cover. Null poster → the existing README §3 gradient placeholder. All Breaking Bad
+seasons share one TMDb poster, so this only visibly matters for anime (separate art per season).
+
+**Q4 — Discovery: username only.** `GET /api/users/search` matches username substring,
+case-insensitive, capped at 20 rows, authed-only; **no email lookup** (privacy call — no email
+enumeration surface). Accepted trade-off: friends must know each other's handles. Mitigation
+added to `/friends`: a "copy/share your `@handle`" affordance so handles can be passed around
+outside the app without ever exposing email addresses.
+
+**Q5 — Reverse pending request → auto-accept.** Send first looks for an existing row in either
+direction; a pending row in the reverse direction is flipped straight to `accepted`.
+
+**Friendship row shape: unchanged** (`requesterId`/`recipientId`, invariant enforced in code —
+transaction + P2002 re-check on send, `deleteMany` of any reverse row on accept). No objection
+was raised, and the table is tiny; the canonical-pair reshape stays available if the race ever
+becomes real.
+
+### 14. Card spec as resolved (what gets built)
+
+**Feed card**
+- header: avatar + display name + `@username` (links to profile)
+- inline horizontal carousel; slides in **canonical season order**, each slide = poster + entry
+  label ("Season 3" / "OVA") + that entry's own rating + caption + date
+- headline: group name · "rated {entry label} · {rating}" · relative time of the bump
+- opens on the entry that generated the latest activity (the thing you tapped to see)
+
+**Profile grid tile**
+- square crop of the earliest entry's poster (`object-cover`, `object-top` so titles/faces
+  survive the 2:3 → 1:1 crop)
+- badges: average rating, and an entry count when > 1
+- tap → full-screen carousel of every entry, opened on **slide 1** (canonical; no "latest
+  activity" context on a profile)
+
+**Permalink** `/u/[username]/p/[postId]` → resolves the post's group and opens the carousel
+**focused on that entry** — unchanged from §4, still the future comment thread.
+
+**Snapshot pagination** (§12): `GET /api/feed?limit=20` → `{ snapshotAt, items, nextCursor }`;
+`GET /api/feed?limit=20&snapshot=<iso>&cursor=<opaque>` with cursor = base64url
+`{a: lastActivityAt, k: groupKey}`. Profile grid uses the same grouping query scoped to one
+user, visibility-checked, capped at 50 groups for MVP.
+
+### 15. Build order (unchanged from §10, now fully specified)
+
+1. Migration: the two index changes (§6) → user runs `migrate deploy` + `migrate dev` drift check.
+2. `lib/friends.ts` + `lib/visibility.ts` + friend-request routes + `/friends` (with the share
+   `@handle` affordance) + `app/(app)/` route group with nav.
+3. `lib/feed.ts` (grouping query + mapper) + `/api/feed` + `/feed`.
+4. Profile grid `/u/[username]` + carousel permalink `/u/[username]/p/[postId]` + privacy states.
+5. Extend `verify-e2e.mjs` with §8's ten checks (adapted to grouped cards) → user runs locally.
