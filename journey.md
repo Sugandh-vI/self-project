@@ -1004,3 +1004,45 @@ requests yet.
 - Post-MVP: manual franchise override for entry grouping; consider naming a franchise group after
   its earliest TV/air-date entry rather than its PREQUEL-chain root (Attack on Titan is currently
   named after the "No Regrets" OVA).
+
+### 12. Revision (user feedback, same session) — one card per franchise, grid + carousel
+
+User's direction, in their words: like Instagram — a **grid of square tiles**, one tile per
+post, and clicking a tile opens a **carousel you can swipe** containing every entry of that
+franchise ("you go to Naruto, and all seasons are logged in one post"). It must **not** render
+as separate posts per season. (They were mid-sentence — "for that, I'm thinking of the thing" —
+so two sub-decisions are still open, see Q1a/Q1b below.)
+
+**Consequence: the card = the franchise group, not the individual Post.** This supersedes the
+flat one-row-per-entry recommendation in §3 (Q1 resolved in the user's favour; the pagination
+cost is handled below).
+
+**The data model does NOT change.** Each entry keeps its own `Post` row — per-entry rating,
+per-entry caption, per-entry timestamp, because README §5 is explicit that a franchise is "not
+one shared rating for the whole franchise". Posts remain the *write/activity* unit; the group is
+a *read* grouping layered on top. The agreed bump semantics survive untouched:
+- new season → new `Post` → the group's `MAX(createdAt)` is now → the card jumps to the top;
+- re-rate → `createdAt` untouched → `MAX(createdAt)` unchanged → the card stays where it was.
+
+Same invariant, same e2e checks — only the query and the rendering change.
+
+**Pagination is the real cost of this choice, and it needs a fix.** Ordering groups by
+`MAX(createdAt)` means a card can move *while the client is scrolling*: a card that was below
+the cursor receives a new entry, jumps above the cursor, and a naive keyset query then skips it
+forever (a silent gap). Fix: **snapshot pagination.** The first page response returns
+`snapshotAt = now()`; every later page is computed as of that instant —
+`MAX(createdAt) WHERE createdAt <= snapshotAt` — so nothing can cross the cursor mid-session.
+Activity newer than the snapshot is excluded until the client refreshes, which is exactly how
+social feeds behave and later becomes a "N new posts" affordance. Without the snapshot,
+duplicate/gap bugs are a matter of time, not luck.
+
+Query shape: Prisma cannot express "group by franchise, order by MAX(createdAt), paginate"
+without N+1 or unbounded fetching, so the ordering pass is a single parameterised `$queryRaw`
+(`Prisma.sql`) returning `(groupKey, lastActivityAt, entryCount)` — where `groupKey` is
+`franchiseGroupId`, or the post id prefixed for standalone movies. The post/title/user rows for
+those groups are then fetched with an ordinary typed Prisma query and assembled by
+`lib/feed.ts`. SQL stays confined to "which groups, in what order"; every row that gets
+serialised to the client is still fetched and typed through Prisma.
+
+Note: `FranchiseGroup` has no poster of its own (it has only `name` + `category`), so a tile's
+image comes from one of its entries' `Title.posterUrl` — see Q1b.
