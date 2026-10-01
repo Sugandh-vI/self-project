@@ -2,8 +2,6 @@
 
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { signOut, useSession } from "next-auth/react";
-import { Button } from "@/components/ui/button";
 import { Poster } from "@/components/poster";
 import { CreatePostDialog } from "@/components/create-post-dialog";
 import type { TitleSearchResult } from "@/lib/titles";
@@ -17,7 +15,6 @@ const TABS = [
 type TabId = (typeof TABS)[number]["id"];
 
 export function SearchExperience() {
-  const { data: session } = useSession();
   const [tab, setTab] = useState<TabId>("movie");
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
@@ -47,20 +44,7 @@ export function SearchExperience() {
 
   return (
     <div className="mx-auto w-full max-w-3xl px-4 py-6">
-      <header className="mb-6 flex items-center justify-between">
-        <h1 className="text-xl font-semibold tracking-tight">
-          Social Movie, TV &amp; Anime Ratings
-        </h1>
-        <div className="flex items-center gap-3 text-sm">
-          <span className="text-muted-foreground">
-            @{session?.user?.username ?? "…"}
-          </span>
-          <Button variant="ghost" onClick={() => signOut({ callbackUrl: "/signin" })}>
-            Sign out
-          </Button>
-        </div>
-      </header>
-
+      {/* Identity + sign-out now live in AppNav, which wraps every authed page. */}
       <div className="flex gap-1 rounded-lg bg-muted p-1" role="tablist">
         {TABS.map((t) => (
           <button

@@ -54,15 +54,27 @@ function skip(name, detail = "") {
   console.log(`  SKIP  ${name}${detail ? ` — ${detail}` : ""}`);
 }
 
+/** `options.sessionToken` overrides which user is making the call — the
+ *  friends checks need three separate identities talking to each other. */
 async function api(path, options = {}) {
+  const { sessionToken = SESSION_TOKEN, ...rest } = options;
   const res = await fetch(`${BASE_URL}${path}`, {
-    ...options,
+    ...rest,
     headers: {
-      Cookie: `${cookieName}=${SESSION_TOKEN}`,
-      ...(options.headers ?? {}),
+      Cookie: `${cookieName}=${sessionToken}`,
+      ...(rest.headers ?? {}),
     },
   });
   return res;
+}
+
+/** JSON helper for the write routes. */
+function jsonPost(body) {
+  return {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  };
 }
 
 async function apiJson(path, options) {
@@ -192,6 +204,24 @@ async function connectDatabase() {
   }
 }
 
+/** Creates a throwaway user + session row directly in the DB, so the API
+ *  routes can be exercised without a Google login. */
+async function seedUser(db, email, username) {
+  const id = `ve2e_${randomBytes(8).toString("hex")}`;
+  const token = `verify-e2e-${randomBytes(16).toString("hex")}`;
+  await db.query(
+    `INSERT INTO "User" (id, email, username, "isPrivate", "createdAt")
+     VALUES ($1, $2, $3, false, NOW())`,
+    [id, email, username]
+  );
+  await db.query(
+    `INSERT INTO "Session" (id, "sessionToken", "userId", expires)
+     VALUES ($1, $2, $3, NOW() + INTERVAL '1 day')`,
+    [`ve2e_s_${randomBytes(8).toString("hex")}`, token, id]
+  );
+  return { id, token, username, email };
+}
+
 async function main() {
   if (!process.env.DATABASE_URL) {
     console.error("DATABASE_URL is not set — run with --env-file=.env");
@@ -202,23 +232,24 @@ async function main() {
   console.log(`Connected to database. Base URL: ${BASE_URL}`);
 
   // ---------------------------------------------------------------- seed
-  section("Setup: throwaway user + session");
-  await db.query(`DELETE FROM "Post" WHERE "userId" IN (SELECT id FROM "User" WHERE email = $1)`, [TEST_EMAIL]);
-  await db.query(`DELETE FROM "Session" WHERE "userId" IN (SELECT id FROM "User" WHERE email = $1)`, [TEST_EMAIL]);
-  await db.query(`DELETE FROM "User" WHERE email = $1`, [TEST_EMAIL]);
+  section("Setup: throwaway users + sessions");
+  // One primary user (A) for the content flows, plus two more (B, C) so the
+  // friends checks have real counterparties.
+  const TEST_EMAILS = [TEST_EMAIL, "verify-e2e-b@local.test", "verify-e2e-c@local.test"];
+  for (const email of TEST_EMAILS) {
+    await db.query(`DELETE FROM "Friendship" WHERE "requesterId" IN (SELECT id FROM "User" WHERE email = $1) OR "recipientId" IN (SELECT id FROM "User" WHERE email = $1)`, [email]);
+    await db.query(`DELETE FROM "Post" WHERE "userId" IN (SELECT id FROM "User" WHERE email = $1)`, [email]);
+    await db.query(`DELETE FROM "Session" WHERE "userId" IN (SELECT id FROM "User" WHERE email = $1)`, [email]);
+    await db.query(`DELETE FROM "User" WHERE email = $1`, [email]);
+  }
 
-  const userId = `ve2e_${randomBytes(8).toString("hex")}`;
-  await db.query(
-    `INSERT INTO "User" (id, email, username, "isPrivate", "createdAt")
-     VALUES ($1, $2, 'verify_e2e', false, NOW())`,
-    [userId, TEST_EMAIL]
-  );
-  await db.query(
-    `INSERT INTO "Session" (id, "sessionToken", "userId", expires)
-     VALUES ($1, $2, $3, NOW() + INTERVAL '1 day')`,
-    [`ve2e_s_${randomBytes(8).toString("hex")}`, SESSION_TOKEN, userId]
-  );
-  console.log("  seeded user + session");
+  // `userId` below is A; SESSION_TOKEN is A's cookie, so every pre-existing
+  // check keeps working unchanged.
+  const A = await seedUser(db, TEST_EMAIL, "verify_e2e");
+  const userId = A.id;
+  const B = await seedUser(db, TEST_EMAILS[1], "friend_b");
+  const C = await seedUser(db, TEST_EMAILS[2], "friend_c");
+  console.log(`  seeded users: ${A.username}, ${B.username}, ${C.username}`);
 
   // Sanity: is the dev server reachable and does our session work?
   let probe;
@@ -238,6 +269,20 @@ async function main() {
   } else {
     check("dev server reachable + session cookie accepted", probe.status === 200, `status ${probe.status}`);
   }
+
+  // ------------------------------------------------- schema: friends indexes
+  // Migration 20261001090000_friends_feed_indexes must be applied, or the feed
+  // and friend-list queries fall back to scans.
+  section("Schema: friends/feed indexes");
+  const friendsFeedIndexRows = await db.query(
+    `SELECT indexname FROM pg_indexes WHERE schemaname = 'public' AND tablename IN ('Post', 'Friendship')`
+  );
+  const friendsFeedIndexNames = friendsFeedIndexRows.rows.map((r) => r.indexname);
+  check("Post_userId_createdAt_idx exists", friendsFeedIndexNames.includes("Post_userId_createdAt_idx"));
+  check("old Post_userId_idx is gone", !friendsFeedIndexNames.includes("Post_userId_idx"));
+  check("Friendship_requesterId_status_idx exists", friendsFeedIndexNames.includes("Friendship_requesterId_status_idx"));
+  check("Friendship_recipientId_status_idx exists", friendsFeedIndexNames.includes("Friendship_recipientId_status_idx"));
+  check("directional unique key kept", friendsFeedIndexNames.includes("Friendship_requesterId_recipientId_key"));
 
   // ------------------------------------------------------------- TV flow
   section("TV flow (TMDb): Breaking Bad, seasons 1 + 2");
@@ -612,12 +657,211 @@ async function main() {
   );
   check("repeat search does not duplicate cached titles", before.rows[0].n === after.rows[0].n);
 
+  // -------------------------------------------------------------- friends
+  section("Friends: requests, accept, decline, cancel, unfriend");
+
+  /** Every row between two users, in either direction. */
+  async function friendshipRows(x, y) {
+    return db.query(
+      `SELECT id, "requesterId", "recipientId", status FROM "Friendship"
+       WHERE ("requesterId" = $1 AND "recipientId" = $2)
+          OR ("requesterId" = $2 AND "recipientId" = $1)
+       ORDER BY status`,
+      [x, y]
+    );
+  }
+
+  const sendAB = await apiJson("/api/friends/requests", jsonPost({ username: B.username }));
+  check(
+    "A sends B a request by username",
+    sendAB.status === 201 && sendAB.body?.status === "pending",
+    `status ${sendAB.status} ${JSON.stringify(sendAB.body)}`
+  );
+
+  const dupAB = await apiJson("/api/friends/requests", jsonPost({ username: B.username }));
+  check(
+    "duplicate request is rejected",
+    dupAB.status === 409 && dupAB.body?.code === "already_requested",
+    `status ${dupAB.status} code ${dupAB.body?.code}`
+  );
+
+  const selfSend = await apiJson("/api/friends/requests", jsonPost({ username: A.username }));
+  check(
+    "self-request is rejected",
+    selfSend.status === 400 && selfSend.body?.code === "self",
+    `status ${selfSend.status} code ${selfSend.body?.code}`
+  );
+
+  const unknownSend = await apiJson(
+    "/api/friends/requests",
+    jsonPost({ username: "definitely_not_a_real_user_xyz" })
+  );
+  check("unknown username is 404", unknownSend.status === 404, `status ${unknownSend.status}`);
+
+  const anon = await apiJson("/api/friends", { sessionToken: "not-a-real-session-token" });
+  check("unauthenticated call is 401", anon.status === 401, `status ${anon.status}`);
+
+  const pendingAB = await friendshipRows(A.id, B.id);
+  check(
+    "exactly one pending row, with A as requester",
+    pendingAB.rows.length === 1 &&
+      pendingAB.rows[0].status === "pending" &&
+      pendingAB.rows[0].requesterId === A.id,
+    `${pendingAB.rows.length} rows, status ${pendingAB.rows[0]?.status}`
+  );
+
+  const bIncoming = await apiJson("/api/friends", { sessionToken: B.token });
+  const incoming = bIncoming.body?.incoming ?? [];
+  const incomingId = incoming.find((r) => r.person.userId === A.id)?.friendshipId;
+  check("B sees the request as incoming", Boolean(incomingId), `${incoming.length} incoming`);
+
+  const accepted = await apiJson(`/api/friends/requests/${incomingId}/accept`, {
+    method: "POST",
+    sessionToken: B.token,
+  });
+  check("B accepts the request", accepted.status === 200, `status ${accepted.status}`);
+
+  const acceptedAB = await friendshipRows(A.id, B.id);
+  check(
+    "row flips to accepted, no second row created",
+    acceptedAB.rows.length === 1 && acceptedAB.rows[0].status === "accepted",
+    `${acceptedAB.rows.length} rows, status ${acceptedAB.rows[0]?.status}`
+  );
+
+  const aAfter = await apiJson("/api/friends");
+  check(
+    "A lists B as a friend",
+    (aAfter.body?.friends ?? []).some((f) => f.userId === B.id),
+    `${aAfter.body?.friends?.length ?? 0} friends`
+  );
+  const bAfter = await apiJson("/api/friends", { sessionToken: B.token });
+  check(
+    "B lists A as a friend",
+    (bAfter.body?.friends ?? []).some((f) => f.userId === A.id)
+  );
+  check(
+    "accepted request leaves the incoming list",
+    (bAfter.body?.incoming ?? []).length === 0,
+    `${bAfter.body?.incoming?.length ?? 0} incoming`
+  );
+
+  const acceptAgain = await apiJson(`/api/friends/requests/${incomingId}/accept`, {
+    method: "POST",
+    sessionToken: B.token,
+  });
+  check("accepting twice is idempotent", acceptAgain.status === 200, `status ${acceptAgain.status}`);
+
+  // Reverse pending request -> auto-accept (approved behaviour, journey §13 Q5)
+  await apiJson("/api/friends/requests", jsonPost({ username: C.username }));
+  const cToA = await apiJson("/api/friends/requests", {
+    ...jsonPost({ username: A.username }),
+    sessionToken: C.token,
+  });
+  check(
+    "reverse pending request auto-accepts",
+    cToA.status === 200 && cToA.body?.status === "accepted",
+    `status ${cToA.status} ${JSON.stringify(cToA.body)}`
+  );
+  const acRows = await friendshipRows(A.id, C.id);
+  check(
+    "auto-accept leaves exactly one row",
+    acRows.rows.length === 1 && acRows.rows[0].status === "accepted",
+    `${acRows.rows.length} rows`
+  );
+
+  // Only the recipient may accept.
+  await apiJson("/api/friends/requests", {
+    ...jsonPost({ username: C.username }),
+    sessionToken: B.token,
+  });
+  const bcRows = await friendshipRows(B.id, C.id);
+  const bcId = bcRows.rows[0]?.id;
+  const wrongAccept = await apiJson(`/api/friends/requests/${bcId}/accept`, {
+    method: "POST",
+    sessionToken: B.token,
+  });
+  check(
+    "requester cannot accept their own request",
+    wrongAccept.status === 403 && wrongAccept.body?.code === "forbidden",
+    `status ${wrongAccept.status} code ${wrongAccept.body?.code}`
+  );
+
+  const declined = await apiJson(`/api/friends/${bcId}`, {
+    method: "DELETE",
+    sessionToken: C.token,
+  });
+  check(
+    "C declines B's request",
+    declined.status === 200 && declined.body?.action === "declined",
+    `status ${declined.status} action ${declined.body?.action}`
+  );
+  const bcGone = await friendshipRows(B.id, C.id);
+  check(
+    "declining deletes the row (no rejected status)",
+    bcGone.rows.length === 0,
+    `${bcGone.rows.length} rows`
+  );
+
+  const abId = (await friendshipRows(A.id, B.id)).rows[0]?.id;
+  const unfriended = await apiJson(`/api/friends/${abId}`, { method: "DELETE" });
+  check(
+    "A unfriends B",
+    unfriended.status === 200 && unfriended.body?.action === "unfriended",
+    `status ${unfriended.status} action ${unfriended.body?.action}`
+  );
+  const abGone = await friendshipRows(A.id, B.id);
+  check("unfriending deletes the row", abGone.rows.length === 0, `${abGone.rows.length} rows`);
+
+  const resent = await apiJson("/api/friends/requests", jsonPost({ username: B.username }));
+  const cancelled = await apiJson(`/api/friends/${resent.body?.friendshipId}`, {
+    method: "DELETE",
+  });
+  check(
+    "A cancels their own pending request",
+    cancelled.status === 200 && cancelled.body?.action === "cancelled",
+    `status ${cancelled.status} action ${cancelled.body?.action}`
+  );
+
+  section("Friends: discovery is username-only");
+  const byHandle = await apiJson("/api/users/search?q=friend_");
+  const found = (byHandle.body?.results ?? []).map((r) => r.username);
+  check(
+    "username search finds B and C",
+    found.includes("friend_b") && found.includes("friend_c"),
+    found.join(", ")
+  );
+  check("username search excludes the searcher", !found.includes("verify_e2e"));
+
+  const shortQuery = await apiJson("/api/users/search?q=f");
+  check(
+    "queries under 2 characters return nothing",
+    (shortQuery.body?.results ?? []).length === 0
+  );
+
+  const upperQuery = await apiJson("/api/users/search?q=FRIEND_B");
+  check(
+    "username search is case-insensitive",
+    (upperQuery.body?.results ?? []).some((r) => r.username === "friend_b")
+  );
+
+  const byEmail = await apiJson(
+    `/api/users/search?q=${encodeURIComponent(B.email)}`
+  );
+  check(
+    "email addresses are not searchable (no enumeration surface)",
+    (byEmail.body?.results ?? []).length === 0,
+    (byEmail.body?.results ?? []).map((r) => r.username).join(", ")
+  );
+
   // ------------------------------------------------------------- cleanup
   section("Cleanup");
-  await db.query(`DELETE FROM "Post" WHERE "userId" = $1`, [userId]);
-  await db.query(`DELETE FROM "Session" WHERE "userId" = $1`, [userId]);
-  await db.query(`DELETE FROM "User" WHERE id = $1`, [userId]);
-  console.log("  removed test user, session and posts (cache rows intentionally kept)");
+  for (const u of [A, B, C]) {
+    await db.query(`DELETE FROM "Friendship" WHERE "requesterId" = $1 OR "recipientId" = $1`, [u.id]);
+    await db.query(`DELETE FROM "Post" WHERE "userId" = $1`, [u.id]);
+    await db.query(`DELETE FROM "Session" WHERE "userId" = $1`, [u.id]);
+    await db.query(`DELETE FROM "User" WHERE id = $1`, [u.id]);
+  }
+  console.log("  removed test users, sessions and posts (cache rows intentionally kept)");
   await db.end();
 
   // ------------------------------------------------------------- summary

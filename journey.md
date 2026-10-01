@@ -1121,3 +1121,101 @@ user, visibility-checked, capped at 50 groups for MVP.
 3. `lib/feed.ts` (grouping query + mapper) + `/api/feed` + `/feed`.
 4. Profile grid `/u/[username]` + carousel permalink `/u/[username]/p/[postId]` + privacy states.
 5. Extend `verify-e2e.mjs` with §8's ten checks (adapted to grouped cards) → user runs locally.
+
+---
+
+## 2026-10-01 (session 4, part 2) — friends layer implemented (step 1 + 2 of §15)
+
+Design was signed off first (§13); this entry records what got built. **Step 3 (feed) and
+step 4 (profile) are not started.**
+
+### Migration — `20261001090000_friends_feed_indexes`
+
+Exactly the two index changes from §6, nothing else. Validated by replaying the whole chain
+(init → collision → this one) into PGlite: **13/13 checks pass**, and `EXPLAIN` on the feed
+shape confirms the planner picks it up
+(`Bitmap Index Scan on Post_userId_createdAt_idx … Index Cond: userId = ANY(…)`).
+- `Post_userId_idx` → `Post_userId_createdAt_idx` (drop guarded with `IF EXISTS`; the CREATEs
+  deliberately are not, matching Prisma's own generated migrations — `migrate deploy` applies
+  each file once via `_prisma_migrations`).
+- New `Friendship_requesterId_status_idx` and `Friendship_recipientId_status_idx`.
+- No data rewrite, no backfill, no column changes.
+
+### Code
+
+- **`lib/friends.ts`** — the only module that touches `Friendship`. `getRelation`,
+  `getFriendIds` (the feed's membership filter), `listFriendships` (friends + incoming +
+  outgoing), `sendFriendRequest`, `acceptFriendRequest`, `deleteFriendship`, `searchUsers`,
+  and a `FriendsError` carrying the HTTP status so routes just map it.
+- **`lib/visibility.ts`** — `canViewContent(relation, target)` as a pure function plus
+  `visibilityFor` / `loadProfileByUsername`. Nothing consumes it yet; it is written now so
+  the feed and profile don't invent their own privacy rules.
+- **`lib/api-auth.ts`** — `currentUserId()` / `unauthorized()` / `friendsErrorResponse()`.
+- **Routes**: `GET /api/users/search`, `GET /api/friends`, `POST /api/friends/requests`,
+  `POST /api/friends/requests/[id]/accept`, `DELETE /api/friends/[id]` (decline / cancel /
+  unfriend — one endpoint, because all three are the same row deletion).
+- **Pages**: `app/(app)/` route group (nav wraps every authed page; `/signin` and `/onboarding`
+  stay outside it), `app/(app)/friends/page.tsx` + `components/friends-manager.tsx`,
+  `components/app-nav.tsx` with the incoming-request badge.
+
+### Decisions made while implementing (not in the approved design)
+
+1. **Send is not wrapped in a transaction.** A transaction would close the duplicate-row race
+   for good, but it holds a pooled connection for its duration and the pool is deliberately
+   capped at 5 (`lib/prisma-pool.ts`). Instead: check-then-create, catch P2002, re-read the
+   winning row. Same outcome, no held connection. Reads also tolerate a stray duplicate —
+   `getRelation` orders by `status asc` so an `accepted` row always wins over a `pending` one,
+   and both accept and delete clear any reverse leftover.
+2. **`refetchOnMount: false` instead of `initialDataUpdatedAt`.** The natural way to tell
+   TanStack the server-rendered data is fresh is `initialDataUpdatedAt: Date.now()`, but
+   `react-hooks/purity` fails the lint (and the build) on that — "Cannot call impure function
+   during render" — in both the client component *and* the server component. Passing the
+   timestamp down as a prop hits the same rule at the call site. So the friends query seeds
+   from server data and skips the mount refetch: the page is a dynamic server component, so
+   every navigation already re-renders it with fresh data, and mutations still refetch via
+   `invalidateQueries`.
+3. **No brand wordmark in the nav.** The product name is still TBD (README §1); "Search"
+   doubles as the home link. The Vercel project URL hints at "Out of Ten" but that has never
+   been confirmed — worth settling before launch.
+4. **`Button` gained a `size` prop** (`default` | `sm`) — it only had `variant`.
+5. **Google avatars allowed in `next.config.ts`** (`lh3.googleusercontent.com`), rendered with
+   `unoptimized` like the existing `Poster` component.
+6. `search-experience.tsx` lost its duplicate username/sign-out header, now that AppNav owns it.
+
+### Verification
+
+- `tsc --noEmit`, `eslint`, `next build` all clean; the route table lists all five new routes
+  plus `/friends`, all dynamic.
+- Migration replayed into PGlite: 13/13 (see above). The throwaway validation script was
+  deleted after use — the live assertions live in the harness instead.
+- **`scripts/verify-e2e.mjs` extended**: it now seeds three users (A/B/C) with their own
+  session tokens, `api()` accepts a per-call `sessionToken`, and there are ~20 new checks —
+  schema indexes (5), send/duplicate/self/unknown/401 guards, pending row shape,
+  incoming visibility, accept (200 + row flips + no second row + idempotent re-accept),
+  auto-accept on reverse request (exactly one row), requester-cannot-accept (403),
+  decline/cancel/unfriend (row deleted, correct `action`), and discovery: finds by username,
+  case-insensitive, excludes the searcher, empty under 2 characters, and **returns nothing for
+  a known email address**.
+- **Live verification is pending on the user's machine** — the sandbox has no DB/network
+  egress, as in every previous session.
+
+### Exact local steps for the user
+
+1. `git pull` (branch `arena/01a0f881-self-project`).
+2. `npx prisma migrate status` → expect `20261001090000_friends_feed_indexes` not yet applied.
+3. `npx prisma migrate deploy` → applies the index change.
+4. `npx prisma migrate status` → "Database schema is up to date!"
+5. `npx prisma migrate dev` → drift check, expect "Already in sync". **If it wants to generate
+   a new migration, the hand-written SQL drifted from the schema — report back.**
+6. `npm run dev`, then `npm run verify:e2e` in a second terminal. Expect the previously passing
+   23 checks plus the new friends/index checks (the 5 index checks are the ones that fail if
+   the migration was not applied).
+7. Manual: `/friends` → search your own second account's handle → send → accept from the other
+   account.
+
+### What happens next
+
+Step 3: `lib/feed.ts` (grouping query + shared mapper), `GET /api/feed`, and `/feed` with
+grouped franchise cards and snapshot pagination — then the Feed link joins the nav.
+Step 4: profile grid + carousel permalink + privacy states (this is what consumes
+`lib/visibility.ts`).

@@ -180,7 +180,11 @@ model Post {
 
   @@unique([userId, entryId]) // one Post per user per entry — re-rating updates in place (see open questions)
   @@index([createdAt])
-  @@index([userId])
+  // Composite instead of a bare @@index([userId]): this is the exact shape of
+  // both read paths that matter — the friends feed (`userId IN (…)` ordered by
+  // createdAt) and a profile's grouped posts. It still serves plain userId
+  // lookups, since userId is the leading column.
+  @@index([userId, createdAt])
 }
 
 model Comment {
