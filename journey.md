@@ -1515,3 +1515,104 @@ signed off first — that's the standing gate. Also still outstanding from earli
 credentials (Google OAuth client secret, Supabase DB password, `NEXTAUTH_SECRET`) need rotating
 before launch, and `journey.md` is still missing the ~355 lines that `ad07b34` added and a
 `--theirs` cherry-pick dropped.
+
+---
+
+## 2026-10-02 (session 5, part 2) — three e2e failures root-caused, one real UX gap fixed
+
+User ran `verify:e2e` after pulling step 4: 103/106, with three failures. All three were
+investigated to a mechanism before being touched. Two were bugs in the *tests I wrote*, not in the
+app; one was a genuine gap the user found by hand.
+
+### 1. "season 2 creates a second entry in the SAME group" — NOT a regression, a state leak
+
+The user flagged this as top priority because it had passed at 55/55 and 80/80, and no
+franchise-matching code changed this session. Correct instinct to check, but the grouping code was
+never involved.
+
+**Mechanism.** `cleanup()` deletes `Friendship`, `Post`, `Session` and `User` — and deliberately
+nothing else. `Title`, `Entry` and `FranchiseGroup` are the shared catalog and outlive the run that
+created them. The check asserted an *absolute* count over that shared table:
+
+```sql
+SELECT … FROM "Entry" WHERE "franchiseGroupId" = $1   -- expected rowCount = 2
+```
+
+So the count is "every season of this show any run ever created":
+
+- run 1 (55/55): TV flow creates S1, S2 → 2 rows → passes.
+- run 2 (80/80): feed section now also creates S3, S4. The TV check runs *before* that, so it
+  still sees only S1, S2 left over from run 1 → 2 rows → passes.
+- run 3 (103/106): now S3 and S4 exist from run 2 → 4 rows → **fails**.
+
+That is exactly the observed pattern, and the same output confirms it independently: the carousel
+was reported as carrying S1–S4 even though this run only posted S1, S2 and S3 in that group. The
+number of failures (1) and the timing (third run, one run after the feed section started posting
+extra seasons) both fit.
+
+**Fix.** Count the entries *this user has posted* in the group (`Entry JOIN Post … WHERE
+p."userId" = $2`) and assert those are seasons 1 and 2. That is the claim actually being made, and
+it is stable no matter how many times the suite runs. It still fails if a new season lands in a
+*different* group, which is the regression it exists to catch.
+
+Audited every other count in the script for the same latent leak — the rest are keyed on unique
+columns (`sourceKey`, `entryKey`, `(source, category, sourceId)`) or use a lower bound, so they are
+idempotent. This was the only one.
+
+### 2 & 3. The permalink focus checks — the app was right, my assertion was wrong
+
+`getCardForPost` was not at fault. Before touching anything I server-rendered the real
+`FeedCard` in a stubbed harness (tsc → `react-dom/server`) with focus set to Season 4. Output:
+
+```html
+<p class="text-sm font-medium">Breaking Bad<span class="text-muted-foreground"> · <!-- -->Season 4</span></p>
+```
+
+Season 4 — the correct slide. The chain `getCardForPost → buildCards(focusEntryId) → FeedCard`
+works, which the passing data-layer check (`the carousel opens on the entry that caused the bump`)
+had already implied, since both go through the same `buildCards` focus argument.
+
+The test failed for a rendering reason: React puts each expression in its own element and marks the
+join with an empty comment, so the sentence a visitor reads is never a contiguous string in the
+HTML. My `readable()` helper stripped only comments, not tags.
+
+**Fix.** Two clearly-named views instead of one, each with the job it is for:
+
+- `readable(html)` — strip comment markers, keep attribute text (for the slide `aria-label`s).
+- `textOf(html)` — strip comments *and* tags, leaving visible text (for the caption sentence).
+
+Also tightened the two adjacent checks: "whole franchise present" now asserts each slide's
+`aria-label="Season N"` rather than a loose substring, and a new check asserts the caption is *not*
+showing some other season's label, so the positive check can't pass by coincidence.
+
+### 4. Real gap: friends list had no route into a profile
+
+The user found by hand that on `/friends` a friend's `@handle` was plain text. Fixed:
+`PersonRow` in `friends-manager.tsx` now wraps the handle in a `Link` to `/u/[username]`, covering
+friends, incoming and outgoing rows alike. Users without a username (onboarding incomplete) have no
+profile URL and stay plain text. **Not covered by e2e** — the friends list is client-rendered from
+`useQuery`, so it never appears in the server HTML; it needs a manual click-through.
+
+### Verification
+
+`tsc`, `eslint` clean. The build was not re-run (no app-code change beyond the one `Link`), and
+**`verify:e2e` cannot run in this sandbox** — there is no `.env`/`DATABASE_URL` here, so the user
+re-runs it locally.
+
+### Correction: journey.md was never missing anything
+
+Earlier notes claimed a `--theirs` cherry-pick had dropped ~355 lines that `ad07b34` added, and
+that was carried forward as an outstanding task. It is **false**, and I should have re-checked it
+before repeating it:
+
+- `ad07b34` — "Log resolved friends/feed design decisions (sign-off round)" — added **75** lines to
+  `journey.md`, not ~355. (The commit is unreachable in this clone now that the remote has been
+  rewritten; the figure comes from the GitHub API.)
+- Those 75 lines (§13 Resolved design, §14 Card spec, §15 Build order) are **already present** at
+  lines 1050 / 1092 / 1116.
+- Verified properly rather than by eye: `ad07b34:journey.md` is a contiguous substring of the
+  current file, lines 1–1123 are byte-identical, and 0 of its 971 non-empty lines are missing.
+
+Nothing to restore. The earlier note was based on inspecting a moved HEAD and an inflated estimate —
+the same class of mistake as the pglite false alarm, so worth stating plainly rather than quietly
+dropping.

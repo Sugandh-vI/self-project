@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Avatar } from "@/components/avatar";
 import { Button } from "@/components/ui/button";
@@ -301,7 +302,19 @@ function PersonRow({
     <div className="flex items-center gap-3 rounded-lg border p-3">
       <Avatar user={person} />
       <div className="min-w-0">
-        <p className="truncate text-sm font-medium">@{person.username}</p>
+        {/* The handle is the way into someone's profile. A user who hasn't
+            finished onboarding has no username and therefore no profile URL,
+            so they render as plain text. */}
+        {person.username ? (
+          <Link
+            href={`/u/${person.username}`}
+            className="block truncate text-sm font-medium hover:underline"
+          >
+            @{person.username}
+          </Link>
+        ) : (
+          <p className="truncate text-sm font-medium">@…</p>
+        )}
         {person.name && (
           <p className="truncate text-xs text-muted-foreground">
             {person.name}

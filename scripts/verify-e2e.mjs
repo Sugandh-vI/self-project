@@ -399,18 +399,27 @@ async function main() {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ titleId: tvTitle.titleId, seasonNumber: 2, rating: 7 }),
   });
-  const entries = await db.query(
-    `SELECT id, "entryKey", "seasonNumber", "franchiseGroupId" FROM "Entry"
-     WHERE "franchiseGroupId" = $1 ORDER BY "seasonNumber"`,
-    [group.rows[0].id]
-  );
-  const postsForGroup = await db.query(
-    `SELECT COUNT(*)::int AS n FROM "Post" WHERE "userId" = $1 AND "entryId" = ANY($2::text[])`,
-    [userId, entries.rows.map((e) => e.id)]
+  // Entry and FranchiseGroup rows are the shared catalog and deliberately
+  // outlive the run that created them — cleanup only removes users and their
+  // posts. Counting every entry a group has ever held therefore creeps up by
+  // one each time the suite runs (the feed section adds seasons 3 and 4), and
+  // the check fails on the second run for no reason. Count the entries *this
+  // user has posted* in the group instead: that is the claim being made.
+  const groupEntries = await db.query(
+    `SELECT e.id, e."entryKey", e."seasonNumber" FROM "Entry" e
+     JOIN "Post" p ON p."entryId" = e.id
+     WHERE e."franchiseGroupId" = $1 AND p."userId" = $2
+     ORDER BY e."seasonNumber"`,
+    [group.rows[0].id, userId]
   );
   check(
     "season 2 creates a second entry in the SAME group (feed event)",
-    post2.status === 200 && entries.rowCount === 2 && postsForGroup.rows[0].n === 2
+    post2.status === 200 &&
+      groupEntries.rowCount === 2 &&
+      groupEntries.rows.map((row) => row.seasonNumber).join(",") === "1,2",
+    `${groupEntries.rowCount} entries in this group for this user: ${groupEntries.rows
+      .map((row) => `S${row.seasonNumber}`)
+      .join(", ")}`
   );
 
   // ---------------------------------------------------------- movie flow
@@ -1094,9 +1103,16 @@ async function main() {
     };
   }
 
-  // React separates adjacent text nodes with empty comments (`a<!-- --> · `);
-  // stripping them lets an assertion match the sentence a human reads.
+  // React splits adjacent expressions into their own elements and marks the
+  // joins with empty comments, so what a visitor reads as one sentence is
+  // `Breaking Bad<span …> · <!-- -->Season 4</span>` in the markup. Two views:
+  //   readable() — drop the comment markers, keeping attribute text
+  //   textOf()   — drop comments *and* tags, leaving only the visible text
+  // The paired focus checks below need textOf: the group name and the entry
+  // label are siblings across a tag boundary, so the sentence is never a
+  // contiguous string in the raw HTML.
   const readable = (html) => html.replace(/<!--[\s\S]*?-->/g, "");
+  const textOf = (html) => readable(html).replace(/<[^>]+>/g, "");
 
   // --- /api/users/[username] ---------------------------------------------
   const summaryAsC = await apiJson(`/api/users/${A.username}`, { sessionToken: C.token });
@@ -1211,23 +1227,36 @@ async function main() {
   // --- the permalink: every entry of the franchise, focused slide ---------
   const permalinkAsC = await pageOf(`/u/${A.username}/p/${firstBb.id}`, { sessionToken: C.token });
   check("a permalink opens", permalinkAsC.status === 200, `status ${permalinkAsC.status}`);
-  const permalinkText = readable(permalinkAsC.html);
+  // Every entry is rendered as its own slide (role="group" + aria-label), so
+  // the presence of each label is what proves the whole franchise is here.
   check(
     "the carousel carries the whole franchise, not just the linked entry",
-    bbPosts.rows.every((row) => permalinkText.includes(`Season ${row.seasonNumber}`)),
+    bbPosts.rows.every((row) =>
+      permalinkAsC.html.includes(`aria-label="Season ${row.seasonNumber}"`)
+    ),
     bbPosts.rows.map((row) => `S${row.seasonNumber}`).join(", ")
   );
   check(
     "the permalink opens on the slide it names",
-    permalinkText.includes(`Breaking Bad · Season ${firstBb.seasonNumber}`),
+    textOf(permalinkAsC.html).includes(`Breaking Bad · Season ${firstBb.seasonNumber}`),
     `looked for 'Breaking Bad · Season ${firstBb.seasonNumber}'`
+  );
+  check(
+    "…and not on some other slide",
+    bbPosts.rows
+      .filter((row) => row.id !== firstBb.id)
+      .every(
+        (row) =>
+          !textOf(permalinkAsC.html).includes(`Breaking Bad · Season ${row.seasonNumber}`)
+      ),
+    `focused on S${firstBb.seasonNumber}`
   );
 
   const permalinkLast = await pageOf(`/u/${A.username}/p/${lastBb.id}`, { sessionToken: C.token });
   check(
     "a different entry deep-links to its own slide",
     permalinkLast.status === 200 &&
-      readable(permalinkLast.html).includes(`Breaking Bad · Season ${lastBb.seasonNumber}`),
+      textOf(permalinkLast.html).includes(`Breaking Bad · Season ${lastBb.seasonNumber}`),
     `looked for 'Breaking Bad · Season ${lastBb.seasonNumber}'`
   );
 
@@ -1262,7 +1291,7 @@ async function main() {
   const privateGridB = await pageOf(`/u/${A.username}`, { sessionToken: B.token });
   check(
     "the locked state is rendered instead of a grid",
-    privateGridB.status === 200 && readable(privateGridB.html).includes("This account is private."),
+    privateGridB.status === 200 && textOf(privateGridB.html).includes("This account is private."),
     `status ${privateGridB.status}`
   );
   check(
