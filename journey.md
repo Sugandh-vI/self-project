@@ -1301,3 +1301,79 @@ It can be silenced with `PRISMA_HIDE_UPDATE_MESSAGE=true` if it gets noisy.
 - 3 migrations, database up to date, no drift, no unapplied changes.
 - Friends layer from part 2 is unaffected (indexes are transparent to the code).
 - Local verification on the user's machine is still pending: `npm run verify:e2e`.
+
+---
+
+## 2026-10-01 (session 4, part 4) — two false alarms: e2e 401 root-caused, pglite was already committed
+
+### 1. `verify:e2e` first check failed with 401 — my harness bug, NOT an auth regression
+
+Symptom: `dev server reachable + session cookie accepted — status 401`, then every authed call
+401'd, then the TV section crashed with `Cannot read properties of undefined (reading 'titleId')`.
+
+**Root cause:** when I refactored single-user seeding into `seedUser()` (part 2), it generated its
+own random session token. So the `Session` row for the primary user held `A.token`, while every
+request sent the module-level `SESSION_TOKEN`. NextAuth looks up the cookie's token, finds no row,
+and returns null → 401 on everything.
+
+Proof (replayed against an in-memory Postgres): with the old behaviour, `SELECT … WHERE
+sessionToken = <SESSION_TOKEN>` returns **0 rows**; after passing `SESSION_TOKEN` into
+`seedUser`, it returns exactly one row for `verify_e2e`; an unknown token returns 0, so the new
+check can actually fail rather than being a tautology.
+
+**The app's auth is untouched and real sessions were never affected:**
+- `git diff main HEAD -- lib/auth.ts` → empty; `app/api/search/route.ts` → empty;
+- there is **no middleware file** anywhere in the repo (the user's first hypothesis);
+- the new friends routes only *read* the session via `getServerSession(authOptions)`, the same
+  call the pre-existing routes have always made;
+- the DB-direct checks in the same run (the 5 index checks) all passed, because they don't go
+  through the app — consistent with a cookie problem and not a server problem.
+
+Fixes:
+- `seedUser(db, email, username, token)` — A is now seeded with `SESSION_TOKEN` explicitly.
+- **New setup assertion:** after seeding, the harness looks up the exact token it is about to send
+  and requires one unexpired row. A token mismatch now fails at "Setup" with a readable message
+  instead of masquerading as an app-wide auth failure 40 lines later.
+- **Fail fast + diagnose:** if the dev-server probe is not 200, the harness stops and prints the
+  three real candidates (missing/expired session row; `NEXTAUTH_SECRET` in `.env` not matching the
+  one the running dev server loaded; `NEXTAUTH_URL` not matching the base URL), then cleans up its
+  users. No more cascading crash three sections later.
+
+### 2. `npm run verify:schema` could not run — nothing was missing; I measured wrong
+
+**Correction to what I told the user earlier in this session.** I reported that the sandbox reset
+had reverted `package.json` and dropped `@electric-sql/pglite` from the commit. That was wrong.
+`git show HEAD:package.json` showed no pglite because **the sandbox's HEAD had been moved to a
+different commit by a reset when I ran the check** — I was reading a snapshot commit, not the
+branch tip. The commit `34f7ef3` does contain:
+- `package.json` → `"@electric-sql/pglite": "^0.5.8"` and the `verify:schema` script;
+- `package-lock.json` → 3 pglite entries;
+- `schema.prisma` → both `Friendship` indexes;
+- every friends-layer file.
+
+Verified end-to-end the way the user would: copied **only** `package.json` + `package-lock.json`
+out of the commit into an empty directory, ran `npm ci`, and ran the script → pglite installs
+(446 packages) and the drift check passes **39/39**. So the user's `ERR_MODULE_NOT_FOUND` is simply
+"the dependency was added after your last `npm install`" — `npm install` fixes it.
+
+**Process lesson, and it is the real one behind both incidents this session:** the sandbox's git
+HEAD moves on its own between tool calls (observed: `34f7ef3` in one call, back to `4b73436` in the
+next, with the working tree intact). Working-tree state and committed state are therefore different
+things here. **Verify with `git show <ref>:<file>` against an explicit ref, never by looking at the
+file on disk or at `git status`.** I now do this on every commit before telling the user it's pushed
+(the four greps against `origin/arena/…` after pushing are the new habit).
+
+Recovery when a reset drops the branch to the branch point while the working tree keeps
+everything: `git fetch origin && git reset --mixed origin/arena/01a0f881-self-project`, then
+`git add -A && git commit`. (`--soft` leaves a stale index that makes a dozen files look deleted
+while they sit on disk untracked; `--mixed` clears it — worth remembering, it cost a detour.)
+
+### State after this
+
+- `34f7ef3..5953610` pushed. Committed content re-verified at the remote tip (harness fix, pglite
+  in package.json + lockfile, both Friendship indexes in schema.prisma).
+- Database: `prisma migrate dev` reports "Already in sync" and
+  `prisma migrate diff … --script` prints an empty migration — **the drift from part 3 is resolved
+  and confirmed by the user on the real database.**
+- `npm run verify:schema` → 39/39 (locally, and from a clean `npm ci`).
+- Outstanding: `npm run verify:e2e` on the user's machine, now with the token fix.
