@@ -1697,3 +1697,130 @@ required by §7 before launch; and `README.md` §12 still claims no code has bee
 **Correction to the previous entry's "What happens next":** it repeats the claim that `journey.md`
 is missing ~355 lines from `ad07b34`. That is false — see the correction above. `ad07b34` added 75
 lines, and all 971 of its non-empty lines are present in the current file.
+
+---
+
+## 2026-10-02 (session 6) — backend completion pass: DESIGN (awaiting sign-off)
+
+Comments as the main build, the settings surface riding along (username change, uploaded profile
+picture, privacy toggle). Backend only — no visual work in this pass, per an explicit scope
+boundary from the user. This entry is the design; nothing is implemented yet.
+
+### §16. Comments
+
+**Data model: no migration needed.** The `Comment` table (`id`, `postId`, `userId`, `text`,
+`createdAt`, `@@index([postId])`) already exists from `20260927090000_init`. It has been sitting
+there unused since the data model was designed.
+
+Signed off by the user:
+
+1. **Who can comment — reuse `canView`.** Same rule as everything else: `self` and `friends` see
+   all, everyone else sees a public profile and nothing of a private one. No new visibility rule,
+   and `lib/visibility.ts` stays the only place that decides.
+2. **Comments do NOT bump the feed.** A badge with the count instead.
+3. **Entry-level** (`Comment.postId` → one entry), not franchise-level. Matches §5's "deep-link
+   back to the correct entry/slide."
+4. **Deletion:** the author deletes their own comment; the post owner can also delete any comment
+   on their own post. No editing in MVP.
+5. **Flat thread, no replies.**
+
+**Endpoints**
+
+| Route | Notes |
+|---|---|
+| `GET /api/posts/[postId]/comments` | Oldest first. `?limit=` (default 50, max 100) + `hasMore`. 404 when the post does not exist **or** the viewer may not see it — the same "don't confirm it exists" rule as the permalink. |
+| `POST /api/posts/[postId]/comments` | `{ text }` → 201. `canView` required. |
+| `DELETE /api/comments/[commentId]` | Author or post owner. Matches the existing `DELETE /api/friends/[id]` style. |
+
+**Validation:** `text` trimmed, required, 1–1000 characters. Empty/whitespace-only → 400.
+
+**No bump, by construction.** Comments live in their own table, so `Post.createdAt` (feed
+ordering) and `Post.updatedAt` (the "edited" indicator) are both untouched. The invariant does not
+need defending with extra code — it falls out of the schema.
+
+**Comment count in the feed.** `buildCards()` attaches `commentCount` to each `FeedEntry`, fetched
+with one `GROUP BY postId WHERE postId IN (…)` over the page's posts — no N+1. Per-entry, per
+decision 3; the card shows the count for the entry currently displayed.
+
+**Cascades.** Deleting a `Post` deletes its comments; deleting a `User` deletes theirs. Both
+already cascade in the schema.
+
+**Open consequence of unfriending.** Comments are *not* deleted when a friendship ends. After
+A unfriends B, B's comment stays in the database and its visibility follows `canView` on the post
+owner: A still sees it, mutual friends still see it, and B sees it again if they re-friend. That is
+how every social app behaves, but it is a decision rather than a default, so it is recorded here.
+
+### §17. Settings surface
+
+**API routes, not server actions.** Onboarding sets the username through a server action
+(`app/onboarding/actions.ts` + `useActionState`), which works but cannot be exercised by
+`verify-e2e.mjs` — the harness speaks HTTP. Every mutation in this milestone is covered by live
+checks, and I do not want the settings surface to be the first thing that ships unverified. So:
+routes, with the settings form calling them exactly like `/friends` does.
+
+| Route | Notes |
+|---|---|
+| `GET /api/me` | The viewer's own profile (id, username, name, image, isPrivate). |
+| `PATCH /api/me` | `{ username? }` and/or `{ isPrivate? }`. |
+| `POST /api/me/avatar` | Multipart image upload → Cloudinary → `User.image`. |
+| `DELETE /api/me/avatar` | Restore the Google photo (see the `providerImage` question below). |
+
+**Username rules: one source of truth.** Extract `/^[a-z0-9_]{3,20}$/i` + lowercase + uniqueness
+into `lib/usernames.ts`, and call it from both the onboarding server action and `PATCH /api/me`.
+Two call sites with a copied regex is how they drift.
+
+Edge case worth naming: submitting your **current** username must be a no-op success, not a 409
+"already taken" against yourself. Compare against the current value before the uniqueness check.
+
+**Session staleness.** Sessions are database-backed, so the server sees the new username on the
+next request — but `useSession()` caches in the browser, so the nav's `@handle` and the avatar
+would lag until a refetch. The settings form must call `update()` from `useSession()` (and
+`router.refresh()` for the server-rendered parts) after each change.
+
+**Cloudinary — credentials needed, when we get there:** `CLOUDINARY_CLOUD_NAME`,
+`CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET` (a single `CLOUDINARY_URL` works too). Asked for one
+at a time, as always, and flagged dev-only pending rotation.
+
+Upload path: **server-side** (browser → our route → Cloudinary). The secret never leaves the
+server, and — unlike a direct browser-to-Cloudinary signature flow — the e2e harness can exercise
+it with a multipart POST. Validation: `image/jpeg|png|webp`, 2 MB max, 400 otherwise. Store under
+a fixed `public_id` per user so re-uploads overwrite instead of orphaning old assets, and apply
+`c_fill,g_face,w_256,h_256` — the "normalizes inconsistent sizes" reason Cloudinary is in the
+stack at all. e2e: validation checks always run; the live upload check runs only when the
+Cloudinary env vars are present, matching how the script already handles unavailable external APIs.
+
+### §18. Audit: gaps found while reading the code for this pass
+
+Everything below was found by reading the current code, not from memory.
+
+**Recommend including in this pass**
+
+| # | Gap | Why it belongs |
+|---|---|---|
+| 1 | **No way to delete a rating.** `app/api/posts/route.ts` has only `POST` — you can rate and re-rate, never un-rate. | The most basic missing write. Author-only `DELETE /api/posts/[postId]`; comments cascade automatically. |
+| 2 | **No caption length cap** on `POST /api/posts` (and none planned for comment text). | A 1 MB caption is currently accepted. Cap both: 2000 for captions, 1000 for comments. |
+| 3 | **`/api/friends/requests` resolves usernames case-sensitively** (`where: { username }`), while search is `mode: "insensitive"` and profile URLs are lowercased. | Latent inconsistency. No UI path hits it today (both callers send `userId`), but the API accepts a username and would 404 on `Suzaku_882`. One-line lowercase normalisation. |
+| 4 | **No TMDb/AniList attribution anywhere** (README §7: "must be respected in the final product"). | A licensing requirement, not a feature. One line of credit text. |
+| 5 | **No `not-found.tsx` or `error.tsx` anywhere in the app.** | `notFound()` from the profile and permalink falls through to Next's default, and any thrown server error gets the stock page. Minimal, unstyled handlers — this is error-state completeness, not design. |
+
+**Recommend, but they need a decision**
+
+| # | Question | My read |
+|---|---|---|
+| 6 | **Username change breaks every existing permalink.** `/u/<old>/p/<id>` 404s the moment the handle changes. | Add `GET /p/[postId]` that redirects to the current canonical URL — ~15 lines, no schema change. We are *deliberately* adding username edit, which turns link rot from a hypothetical into a certainty. Strongly recommend. |
+| 7 | **DP upload is not reversible.** Overwriting `User.image` destroys the Google photo URL with no way back. | Add `User.providerImage String?` (one small migration) so `DELETE /api/me/avatar` restores it. Without it, "remove" can only fall back to initials. |
+| 8 | **No account deletion.** No path exists to delete an account, though the schema already cascades posts, comments and friendships. | Probably post-MVP — but it should be a conscious "not yet" rather than an oversight. |
+
+**Noted, no action now**
+
+| # | Item | Note |
+|---|---|---|
+| 9 | Profile grid caps at 50 groups with no pagination | As specified in §13 for MVP. Correct as built. |
+| 10 | No rate limiting anywhere | Fine at current scale. Revisit before public launch. |
+| 11 | Onboarding copy says "You can't change it later for now." | Becomes false the moment username change ships — one sentence to update. |
+| 12 | `Comment` table has no `@@index([userId])` | Not needed: every read path is `WHERE postId = …`. |
+
+### What happens next
+
+Awaiting explicit sign-off on the above before any code is written — specifically items 1–8, which
+are additions beyond what the user listed. Anything not countermanded will be built as recommended.

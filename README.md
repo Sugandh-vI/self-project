@@ -164,7 +164,15 @@ across without context-switching languages.
 
 ## 12. Status
 
-This README reflects the ideation and planning phase only. No code has been written yet.
+Planning is done and the core loop is built and verified: Google sign-in and onboarding,
+category-routed search against a local title cache, rating posts with franchise/season
+grouping for TV and anime, friend requests, the friends feed, and profiles with the carousel
+permalink and private accounts.
+
+Not built yet: comments on posts (Section 3), and the settings surface — changing your
+username, uploading a profile picture (Section 8), and toggling a private profile. Outstanding
+before launch: visible TMDb and AniList attribution (Section 7).
+
 See `journey.md` for a running log of implementation progress, decisions made during
 development, and what should happen next — that file should be read first at the start of
 every new coding session, and updated at the end of every session.
