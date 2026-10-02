@@ -1641,3 +1641,59 @@ The root cause stands, on evidence that does hold:
 
 Everything else in the entry above is unaffected: the fix, the audit of the other counts, the two
 permalink assertions, and the friends-list link.
+
+---
+
+## 2026-10-02 (session 5, part 3) — friends + feed + profile milestone CLOSED
+
+**User verified: `verify:e2e` 107/107, all sections green.** That includes the three checks fixed
+this session: the TV grouping check (now scoped to the user's own posts and therefore stable across
+repeated runs) and both permalink slide-focus checks.
+
+**Manual verification, real accounts:** logged in as `lelouch_833`, clicked `@suzaku_882` straight
+from the Friends list, landed on his profile with his tiles (Death Note, Squid Game) and the correct
+"Friends · Remove" relationship controls. The friends-list → profile link is the one fix this
+session that e2e cannot cover — the list is client-rendered from `useQuery`, so it never appears in
+the server HTML — which makes this manual pass the actual proof for it.
+
+### What the milestone delivered
+
+Steps 1–4 of §15, in order: the index migration, `lib/friends.ts` + `lib/visibility.ts` + the
+friend-request routes + `/friends`, then `lib/feed.ts` + `/api/feed` + `/feed`, then the profile
+grid + carousel permalink + private accounts. Every one of the design decisions in §13 (tile number
+= average, tile poster = earliest entry, username-only discovery, reverse request auto-accepts) is
+implemented the way it was signed off, and the §5 bump rule — a new season bumps, a re-rate does not
+— is enforced by `createdAt` and pinned down by checks in both the feed and the profile sections.
+
+`verify-e2e.mjs` grew from 55 checks to 107 over the milestone, and every section is a live HTTP +
+DB check rather than a unit test against a mock: a regression in grouping, bumping, pagination or
+visibility fails the suite.
+
+### Audit: what the README still promises that does not exist
+
+Run before recommending a direction, so the next session starts from facts rather than memory.
+
+| README | State |
+|---|---|
+| §3 — "Comments from other users underneath" | **Not built.** The `Comment` model exists (with `@@index([postId])`) but there is zero code referencing it. |
+| §8 — user can upload their own profile picture via Cloudinary | **Not built.** `cloudinary@^2.11.0` is installed and never imported. Image is the Google photo only. |
+| §8 — "users can set their profile to public or private" | **Built but unreachable.** `isPrivate` is in the schema, the session and `lib/visibility.ts`, and the locked UI is done — but nothing sets it. There is no settings page at all; the e2e suite flips it with raw SQL. |
+| §7 — visible TMDb/AniList attribution | **Absent.** No attribution anywhere in the app. |
+| §12 — README status line | **Stale.** Still says "No code has been written yet." |
+
+So: the private-profile surface is complete end to end except for the switch that turns it on, and
+the Comment model has been sitting in the schema since the data model was designed.
+
+### What happens next
+
+Nothing starts without a design write-up and sign-off first — that is the standing gate, and the
+user asked for a recommendation before locking direction. See the session's chat for the
+recommendation and the reasoning behind it.
+
+Housekeeping still outstanding, none of it blocking: dev credentials (Google OAuth client secret,
+Supabase DB password, `NEXTAUTH_SECRET`) need rotating before launch; TMDb/AniList attribution is
+required by §7 before launch; and `README.md` §12 still claims no code has been written.
+
+**Correction to the previous entry's "What happens next":** it repeats the claim that `journey.md`
+is missing ~355 lines from `ad07b34`. That is false — see the correction above. `ad07b34` added 75
+lines, and all 971 of its non-empty lines are present in the current file.
