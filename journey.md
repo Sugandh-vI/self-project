@@ -1616,3 +1616,28 @@ before repeating it:
 Nothing to restore. The earlier note was based on inspecting a moved HEAD and an inflated estimate —
 the same class of mistake as the pglite false alarm, so worth stating plainly rather than quietly
 dropping.
+
+### Correction to the entry above (same session)
+
+One corroborating claim I made was wrong, and the mechanism deserves to rest only on things that
+are actually true. I wrote that the output confirmed the leak because "the carousel was reported as
+carrying S1–S4 even though this run only posted S1, S2 and S3". False — the feed section posts
+season 4 as well (`seasonNumber: 4, rating: 6`, for the snapshot-pagination checks), so this run
+created all four seasons and that observation proves nothing either way.
+
+The root cause stands, on evidence that does hold:
+
+- The check has three conjuncts: `post2.status === 200`, `entries.rowCount === 2`, and
+  `postsForGroup.rows[0].n === 2`. The second counts every `Entry` row the group has *ever* held
+  (shared catalog, never cleaned); the third counts this user's posts, which *is* scoped. A leak
+  predicts the second fails while the third passes — and the failure is exactly that shape, since
+  nothing else about the run changed.
+- The timing fits: the check passed at 55/55 and 80/80 and failed on the third run, i.e. one run
+  after the feed section started creating two extra seasons. A leak shows up one run late by
+  definition; a real grouping regression would have appeared the moment the grouping code changed.
+- No franchise-matching code changed this session, and the two checks that *are* scoped to the
+  user's posts ("a franchise's seasons collapse into ONE card", "the card gains the new entry
+  2 -> 3") both passed in the same run.
+
+Everything else in the entry above is unaffected: the fix, the audit of the other counts, the two
+permalink assertions, and the friends-list link.
