@@ -6,8 +6,7 @@ import { getServerSession } from "next-auth";
 import { Prisma } from "@prisma/client";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
-
-const USERNAME_PATTERN = /^[a-z0-9_]{3,20}$/i;
+import { normalizeUsername, USERNAME_RULES } from "@/lib/usernames";
 
 export type SetUsernameResult = { error: string } | undefined;
 
@@ -18,20 +17,28 @@ export async function setUsername(
   const session = await getServerSession(authOptions);
   if (!session?.user?.id) redirect("/signin");
 
-  const username = String(formData.get("username") ?? "")
-    .trim()
-    .toLowerCase();
-
-  if (!USERNAME_PATTERN.test(username)) {
-    return {
-      error: "3–20 characters, letters, numbers and underscores only.",
-    };
+  // Same rule as the settings page — lib/usernames.ts is the single source of
+  // truth, so the two can't drift.
+  const username = normalizeUsername(formData.get("username"));
+  if (!username) {
+    return { error: USERNAME_RULES };
   }
 
   try {
+    const current = await prisma.user.findUnique({
+      where: { id: session.user.id },
+      select: { image: true, providerImage: true },
+    });
+
     await prisma.user.update({
       where: { id: session.user.id },
-      data: { username },
+      data: {
+        username,
+        // Whatever the avatar is right now is the Google photo — no upload can
+        // exist yet. Remembering it is what makes "remove profile picture"
+        // restorable later.
+        providerImage: current?.providerImage ?? current?.image ?? null,
+      },
     });
   } catch (error) {
     if (

@@ -23,6 +23,7 @@
 // ---------------------------------------------------------------------------
 
 import { prisma } from "@/lib/prisma";
+import { countCommentsByPost } from "@/lib/comments";
 import { Prisma } from "@prisma/client";
 import { getFriendIds } from "@/lib/friends";
 
@@ -40,6 +41,8 @@ export type FeedEntry = {
   posterUrl: string | null;
   category: "movie" | "tv" | "anime";
   permalink: string;
+  /** Comments on this entry. Shown as a badge; never affects feed ordering. */
+  commentCount: number;
 };
 
 export type FeedCard = {
@@ -159,7 +162,8 @@ type GroupRow = {
 function buildCards(
   rows: GroupRow[],
   postsById: Map<string, PostWithRelations>,
-  focusEntryId?: string
+  focusEntryId?: string,
+  commentCounts: Map<string, number> = new Map()
 ): FeedCard[] {
   const cards: FeedCard[] = [];
 
@@ -185,6 +189,7 @@ function buildCards(
       posterUrl: post.entry.title.posterUrl,
       category: post.entry.title.category,
       permalink: `/u/${permalinkUser}/p/${post.id}`,
+      commentCount: commentCounts.get(post.id) ?? 0,
     }));
 
     // Canonical watch order for the carousel: season number, then first rated.
@@ -289,11 +294,15 @@ async function loadGroupCards({
     include: POST_INCLUDE,
   });
 
+  const commentCounts = await countCommentsByPost(posts.map((post) => post.id));
+
   return {
     rows,
     cards: buildCards(
       rows,
-      new Map(posts.map((post) => [post.id, post]))
+      new Map(posts.map((post) => [post.id, post])),
+      undefined,
+      commentCounts
     ),
   };
 }
@@ -378,10 +387,13 @@ export async function getCardForPost(postId: string): Promise<FeedCard | null> {
     post_ids: newestFirst.map((current) => current.id),
   };
 
+  const commentCounts = await countCommentsByPost(posts.map((current) => current.id));
+
   const [card] = buildCards(
     [row],
     new Map(posts.map((current) => [current.id, current])),
-    post.entry.id
+    post.entry.id,
+    commentCounts
   );
   return card ?? null;
 }

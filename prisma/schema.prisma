@@ -46,7 +46,8 @@ model User {
   name          String? // display name from the Google account
   email         String    @unique
   emailVerified DateTime? // set by NextAuth on first Google login
-  image         String? // profile picture URL: Google photo by default, or Cloudinary upload (README Section 8)
+  image         String? // profile picture in use: the Google photo by default, or a Cloudinary upload (README Section 8)
+  providerImage String? // the Google photo, kept so removing an upload can restore it rather than falling back to initials
   username      String?   @unique // chosen during onboarding; null until onboarding is complete
   isPrivate     Boolean   @default(false) // private profile/watch history (README Section 8)
   createdAt     DateTime  @default(now())

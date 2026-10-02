@@ -39,10 +39,16 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Invalid season number" }, { status: 400 });
   }
 
-  const caption =
-    typeof body.caption === "string" && body.caption.trim()
-      ? body.caption.trim()
-      : null;
+  // Captions are stored as-is, so an uncapped one is an unbounded write.
+  const CAPTION_MAX_LENGTH = 2000;
+  const rawCaption = typeof body.caption === "string" ? body.caption.trim() : "";
+  if (rawCaption.length > CAPTION_MAX_LENGTH) {
+    return NextResponse.json(
+      { error: `A caption can be at most ${CAPTION_MAX_LENGTH} characters.` },
+      { status: 400 }
+    );
+  }
+  const caption = rawCaption || null;
 
   const title = await prisma.title.findUnique({ where: { id: titleId } });
   if (!title) {

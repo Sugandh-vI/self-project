@@ -4,6 +4,7 @@ import { requireUser } from "@/lib/auth";
 import { loadProfileByUsername } from "@/lib/visibility";
 import { getCardForPost } from "@/lib/feed";
 import { FeedCard } from "@/components/feed-card";
+import { CommentThread } from "@/components/comment-thread";
 
 // Authed + session-dependent — never prerender.
 export const dynamic = "force-dynamic";
@@ -49,6 +50,10 @@ export default async function PostPage({
       </Link>
 
       <FeedCard card={card} now={null} />
+
+      {/* Comments attach to one entry, matching decision 3: the thread follows
+          the slide you are on. */}
+      <CommentThread postId={postId} canComment />
     </main>
   );
 }

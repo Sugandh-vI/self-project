@@ -1824,3 +1824,72 @@ Everything below was found by reading the current code, not from memory.
 
 Awaiting explicit sign-off on the above before any code is written — specifically items 1–8, which
 are additions beyond what the user listed. Anything not countermanded will be built as recommended.
+
+### §19. Sign-off (2026-10-02)
+
+The user approved the design above in full, including all five audit items I recommended:
+
+1. **Write-path gaps — all three accepted.** `DELETE /api/posts/[postId]`, caption cap 2000 /
+   comment cap 1000, and case-insensitive username lookup in the friend-request API.
+2. **Attribution and error pages — now.** TMDb/AniList credit and minimal `not-found` / `error`
+   handlers go in this pass, not the UI phase.
+3. **`/p/[postId]` redirect — yes.** Old permalinks survive a username change.
+4. **`User.providerImage` — yes.** One migration, so "remove profile picture" restores the Google
+   photo rather than falling back to initials.
+
+Account deletion was raised and deliberately left out: no decision to build it now, and it is
+recorded above as a conscious "not yet" rather than an oversight.
+
+### Implementation notes as I go
+
+Implementation starts here; decisions that only surface while writing code get logged in this
+section rather than retrofitted into the design above.
+
+### Implementation (started 2026-10-02)
+
+Built in this pass:
+
+**Comments** — `lib/comments.ts` (list / create / delete / `countCommentsByPost`),
+`GET+POST /api/posts/[postId]/comments`, `DELETE /api/comments/[commentId]`.
+`FeedEntry.commentCount` is populated in `buildCards` from one grouped query, so the feed adds a
+count per entry with no N+1. No migration: the `Comment` table has existed since `init`.
+
+**Settings** — `GET/PATCH /api/me`, `POST/DELETE /api/me/avatar`, `lib/cloudinary.ts`, a minimal
+`app/(app)/settings` page. Username rules moved to `lib/usernames.ts` and shared with onboarding.
+
+**Audit items 1–5** — `DELETE /api/posts/[postId]`; caption cap 2000 / comment cap 1000;
+case-insensitive username in the friend-request route; TMDb/AniList attribution in the app
+layout footer; `app/not-found.tsx` + `app/error.tsx`.
+
+**Decisions taken while building**
+
+1. **Settings are API routes, not server actions.** Onboarding uses a server action, which works
+   but is invisible to `verify-e2e.mjs` — the harness speaks HTTP. The settings form calls the
+   routes the same way `/friends` does, so every mutation here gets a live check.
+2. **`User.providerImage` backfills on migration.** `UPDATE "User" SET "providerImage" = "image"`
+   runs as part of the migration. Without it, accounts that already finished onboarding — which is
+   every account that exists — would lose their Google photo permanently on their first
+   "remove upload", because onboarding is the only other place the column gets set.
+3. **The avatar route validates before checking configuration.** My first version returned 503 when
+   Cloudinary wasn't configured, which made validation untestable and turned a bad request into a
+   server-availability error. Order is now: parse → validate → configure → upload.
+4. **Uploads are server-side** (browser → our route → Cloudinary), so the secret never leaves the
+   server and the e2e harness can exercise it with a multipart POST — a direct-to-Cloudinary
+   signed flow can't be tested from Node.
+5. **`/p/[postId]` requires the viewer to pass visibility** and 404s otherwise, so it can't be used
+   to probe for the existence of someone else's ratings. Canonical URLs stay username-based because
+   they read better; this is only the fallback that keeps old ones alive.
+6. **A post you can't delete 404s rather than 403s** — same "don't confirm it exists" rule as the
+   private permalink.
+
+**Verification** — `tsc`, `eslint`, `next build` all clean; `verify:schema` 39/39 with the new
+column (`columns User — 9 columns match`). `verify-e2e.mjs` gained sections for comments
+(thread, both deletion rights, 403 for third parties, validation, no-feed-bump, private threads
+404 for non-friends), removing a rating (+ comment cascade + catalog survival), settings
+(username rules, no-op resubmit, 409 collision, avatar validation, privacy toggle end to end),
+username change with permalink survival via `/p/[postId]`, and the input caps. The live avatar
+upload skips itself when Cloudinary isn't configured rather than failing.
+
+**Outstanding:** the user runs `npx prisma migrate deploy` for
+`20261002120000_user_provider_image`, then `npm run verify:e2e`. Cloudinary credentials still
+needed for the live-upload checks.

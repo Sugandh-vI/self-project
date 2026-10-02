@@ -19,7 +19,10 @@ export async function POST(req: NextRequest) {
   }
 
   const byId = typeof body.userId === "string" ? body.userId.trim() : "";
-  const byUsername = typeof body.username === "string" ? body.username.trim() : "";
+  // Lowercased to match the rest of the app: search is case-insensitive and
+  // profile URLs are lowercased, so a handle typed with different casing has
+  // to resolve to the same person.
+  const byUsername = typeof body.username === "string" ? body.username.trim().toLowerCase() : "";
   if (!byId && !byUsername) {
     return NextResponse.json(
       { error: "A username or userId is required." },

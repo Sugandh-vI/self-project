@@ -84,6 +84,13 @@ export function FeedCard({ card, now }: { card: FeedCardData; now: number | null
             {timeLabel(entry.createdAt, now)}
             {entry.updatedAt > entry.createdAt && " · edited"}
           </span>
+          {/* A count, never an ordering signal — comments don't bump the feed. */}
+          {entry.commentCount > 0 && (
+            <span className="text-muted-foreground">
+              {" · "}
+              {entry.commentCount} {entry.commentCount === 1 ? "comment" : "comments"}
+            </span>
+          )}
         </p>
         {entry.caption && (
           <p className="mt-2 whitespace-pre-wrap text-sm text-muted-foreground">

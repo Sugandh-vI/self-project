@@ -1325,6 +1325,348 @@ async function main() {
 
   await db.query(`UPDATE "User" SET "isPrivate" = false WHERE id = $1`, [A.id]);
 
+  // ------------------------------------------------------------- comments
+  section("Comments: thread, permissions, no feed bump");
+
+  const bbPost = firstBb.id; // A's Breaking Bad season 1
+  const commentsOf = (token) => apiJson(`/api/posts/${bbPost}/comments`, { sessionToken: token });
+  const postComment = (token, text) =>
+    apiJson(`/api/posts/${bbPost}/comments`, { ...jsonPost({ text }), sessionToken: token });
+
+  const feedBeforeComments = (await feedOf(C.token, "?limit=30")).body;
+  const orderBeforeComments = (feedBeforeComments?.cards ?? []).map(cardKey);
+  const activityBeforeComments = findCard(feedBeforeComments, A.username, "Breaking Bad")?.lastActivityAt;
+
+  const own = await postComment(SESSION_TOKEN, "Rewatching this");
+  check("you can comment on your own post", own.status === 201, `status ${own.status}`);
+
+  const friendly = await postComment(C.token, "Best season");
+  check("a friend can comment", friendly.status === 201, `status ${friendly.status}`);
+  const friendCommentId = friendly.body?.comment?.id;
+
+  const thread = await commentsOf(C.token);
+  check("the thread lists every comment", thread.body?.comments?.length === 2, `${thread.body?.comments?.length}`);
+  check(
+    "oldest first — a conversation reads top to bottom",
+    thread.body?.comments?.[0]?.text === "Rewatching this",
+    thread.body?.comments?.[0]?.text
+  );
+  check(
+    "each comment carries its author",
+    thread.body?.comments?.[0]?.author?.username === A.username &&
+      thread.body?.comments?.[1]?.author?.username === C.username
+  );
+
+  // Deletion rights, from both sides (decision 4): author OR post owner.
+  const asFriend = thread.body?.comments ?? [];
+  check(
+    "a viewer can delete their own comment, not someone else's",
+    asFriend[0]?.canDelete === false && asFriend[1]?.canDelete === true,
+    `author's own: ${asFriend[1]?.canDelete}, other's: ${asFriend[0]?.canDelete}`
+  );
+  const asOwner = (await commentsOf(SESSION_TOKEN)).body?.comments ?? [];
+  check(
+    "the post owner can delete ANY comment on their post",
+    asOwner.length === 2 && asOwner.every((comment) => comment.canDelete === true),
+    `${asOwner.filter((c) => c.canDelete).length}/${asOwner.length} deletable`
+  );
+
+  const forbiddenDelete = await apiJson(`/api/comments/${asFriend[0].id}`, {
+    method: "DELETE",
+    sessionToken: C.token,
+  });
+  check(
+    "a third party deleting someone else's comment is refused",
+    forbiddenDelete.status === 403 && forbiddenDelete.body?.code === "forbidden",
+    `status ${forbiddenDelete.status}, ${forbiddenDelete.body?.code}`
+  );
+
+  const ownerDeletes = await apiJson(`/api/comments/${friendCommentId}`, {
+    method: "DELETE",
+    sessionToken: SESSION_TOKEN,
+  });
+  check("the post owner can delete a friend's comment", ownerDeletes.status === 200, `status ${ownerDeletes.status}`);
+  check(
+    "…and it is gone",
+    (await commentsOf(C.token)).body?.comments?.length === 1,
+    `${(await commentsOf(C.token)).body?.comments?.length} left`
+  );
+
+  check(
+    "an empty comment is rejected",
+    (await postComment(C.token, "   ")).status === 400
+  );
+  check(
+    "an over-long comment is rejected",
+    (await postComment(C.token, "x".repeat(1001))).status === 400
+  );
+  check(
+    "a 1000-character comment is accepted",
+    (await postComment(C.token, "y".repeat(1000))).status === 201
+  );
+  const missingComment = await apiJson("/api/comments/clh0000000000000000000000", { method: "DELETE" });
+  check("deleting an unknown comment is a 404", missingComment.status === 404, `status ${missingComment.status}`);
+
+  check(
+    "an anonymous read of a thread is rejected",
+    (await apiJson(`/api/posts/${bbPost}/comments`, { sessionToken: "no-such-session-token" })).status === 401
+  );
+
+  // --- comments must not bump the feed ------------------------------------
+  const feedAfterComments = (await feedOf(C.token, "?limit=30")).body;
+  const bbAfterComments = findCard(feedAfterComments, A.username, "Breaking Bad");
+  check(
+    "commenting does NOT reorder the feed",
+    JSON.stringify((feedAfterComments?.cards ?? []).map(cardKey)) === JSON.stringify(orderBeforeComments),
+    "card order unchanged"
+  );
+  check(
+    "commenting does NOT move the group's last activity",
+    bbAfterComments?.lastActivityAt === activityBeforeComments,
+    `${bbAfterComments?.lastActivityAt}`
+  );
+  const commentedEntry = bbAfterComments?.entries?.find((entry) => entry.postId === bbPost);
+  check(
+    "the entry shows a comment count instead",
+    commentedEntry?.commentCount >= 1,
+    `commentCount ${commentedEntry?.commentCount}`
+  );
+
+  // --- a private account's thread is invisible, not just hidden -----------
+  await db.query(`UPDATE "User" SET "isPrivate" = true WHERE id = $1`, [A.id]);
+  check(
+    "a non-friend cannot read a private account's comments",
+    (await commentsOf(B.token)).status === 404,
+    `status ${(await commentsOf(B.token)).status}`
+  );
+  check(
+    "…and cannot comment on it either",
+    (await postComment(B.token, "hello?")).status === 404
+  );
+  check("a friend still can", (await commentsOf(C.token)).status === 200);
+  await db.query(`UPDATE "User" SET "isPrivate" = false WHERE id = $1`, [A.id]);
+
+  // ------------------------------------------------------- removing a post
+  section("Removing a rating");
+
+  const standalone = await db.query(
+    `SELECT p.id FROM "Post" p JOIN "Entry" e ON e.id = p."entryId"
+     WHERE p."userId" = $1 AND e."franchiseGroupId" IS NULL LIMIT 1`,
+    [A.id]
+  );
+  const standaloneId = standalone.rows[0]?.id;
+  await apiJson(`/api/posts/${standaloneId}/comments`, jsonPost({ text: "will cascade" }));
+
+  check(
+    "another user cannot delete your rating",
+    (await apiJson(`/api/posts/${standaloneId}`, { method: "DELETE", sessionToken: B.token })).status === 404
+  );
+  check(
+    "you can delete your own rating",
+    (await apiJson(`/api/posts/${standaloneId}`, { method: "DELETE" })).status === 200
+  );
+  const gonePost = await db.query(`SELECT id FROM "Post" WHERE id = $1`, [standaloneId]);
+  check("the post row is gone", gonePost.rowCount === 0);
+  const orphanComments = await db.query(`SELECT id FROM "Comment" WHERE "postId" = $1`, [standaloneId]);
+  check(
+    "its comments cascade with it",
+    orphanComments.rowCount === 0,
+    `${orphanComments.rowCount} orphaned`
+  );
+  // The shared catalog must survive: other users' posts hang off the same rows.
+  const catalogSurvived = await db.query(
+    `SELECT COUNT(*)::int AS n FROM "Entry" WHERE "franchiseGroupId" IS NOT NULL`
+  );
+  check(
+    "deleting a post leaves the shared catalog intact",
+    catalogSurvived.rows[0].n > 0,
+    `${catalogSurvived.rows[0].n} grouped entries still present`
+  );
+
+  // ------------------------------------------------------------- settings
+  section("Settings: username, privacy, profile picture");
+
+  const me = await apiJson("/api/me");
+  check("you can read your own account", me.status === 200 && me.body?.user?.id === A.id, `status ${me.status}`);
+  check("the private flag is reported", me.body?.user?.isPrivate === false);
+
+  check(
+    "a too-short username is rejected",
+    (await apiJson("/api/me", { ...jsonPost({ username: "ab" }), method: "PATCH" })).status === 400
+  );
+  check(
+    "an illegal character is rejected",
+    (await apiJson("/api/me", { ...jsonPost({ username: "bad name!" }), method: "PATCH" })).status === 400
+  );
+  const noopPatch = await apiJson("/api/me", {
+    ...jsonPost({ username: A.username }),
+    method: "PATCH",
+  });
+  check(
+    "re-submitting your own username is a no-op, not a collision",
+    noopPatch.status === 200,
+    `status ${noopPatch.status}`
+  );
+  const takenPatch = await apiJson("/api/me", {
+    ...jsonPost({ username: B.username }),
+    method: "PATCH",
+  });
+  check(
+    "someone else's username is a 409",
+    takenPatch.status === 409 && takenPatch.body?.code === "username_taken",
+    `status ${takenPatch.status}`
+  );
+  const emptyPatch = await apiJson("/api/me", { ...jsonPost({}), method: "PATCH" });
+  check("an empty update is rejected", emptyPatch.status === 400, `status ${emptyPatch.status}`);
+
+  // Avatar upload: validation always runs; the live upload needs credentials.
+  const PNG_1PX = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+    "base64"
+  );
+  const avatarForm = (bytes, type, name = "avatar.png") => {
+    const form = new FormData();
+    form.append("file", new Blob([bytes], { type }), name);
+    return { method: "POST", body: form };
+  };
+  check(
+    "a non-image upload is rejected",
+    (await apiJson("/api/me/avatar", avatarForm(Buffer.from("not an image"), "text/plain"))).status === 400
+  );
+  check(
+    "an oversized upload is rejected",
+    (
+      await apiJson("/api/me/avatar", avatarForm(Buffer.alloc(3 * 1024 * 1024), "image/png"))
+    ).status === 413
+  );
+  check(
+    "an upload with no file is rejected",
+    (await apiJson("/api/me/avatar", { method: "POST", body: new FormData() })).status === 400
+  );
+
+  const liveUpload = await apiJson("/api/me/avatar", avatarForm(PNG_1PX, "image/png"));
+  if (liveUpload.status === 503 && liveUpload.body?.code === "upload_unavailable") {
+    skip("a real avatar upload", "Cloudinary credentials not configured");
+    skip("removing an upload restores the Google photo", "needs a live upload first");
+  } else {
+    check("a real avatar upload succeeds", liveUpload.status === 200, `status ${liveUpload.status}`);
+    check(
+      "the returned URL is stored on the account",
+      (await apiJson("/api/me")).body?.user?.image === liveUpload.body?.imageUrl,
+      liveUpload.body?.imageUrl
+    );
+    const removed = await apiJson("/api/me/avatar", { method: "DELETE" });
+    check("removing an upload succeeds", removed.status === 200, `status ${removed.status}`);
+    check(
+      "removing an upload restores the Google photo, not initials",
+      removed.body?.imageUrl !== null,
+      `image ${removed.body?.imageUrl ?? "null"}`
+    );
+  }
+
+  check(
+    "an anonymous settings read is rejected",
+    (await apiJson("/api/me", { sessionToken: "no-such-session-token" })).status === 401
+  );
+
+  // Privacy toggle: the switch the locked-profile UI has been waiting for.
+  const privatePatch = await apiJson("/api/me", {
+    ...jsonPost({ isPrivate: true }),
+    method: "PATCH",
+  });
+  check("you can make your profile private", privatePatch.status === 200 && privatePatch.body?.user?.isPrivate === true);
+  check(
+    "…and the locked state kicks in for a non-friend",
+    tileIdsOf((await pageOf(`/u/${A.username}`, { sessionToken: B.token })).html).size === 0
+  );
+  check("…while a friend still sees the grid", (await pageOf(`/u/${A.username}`, { sessionToken: C.token })).status === 200);
+  await apiJson("/api/me", { ...jsonPost({ isPrivate: false }), method: "PATCH" });
+  check(
+    "…and it can be turned back off",
+    (await apiJson("/api/me")).body?.user?.isPrivate === false
+  );
+
+  // ------------------------------------------- username change + link rot
+  section("Username change and permalink survival");
+
+  const NEW_USERNAME = `${A.username}_new`;
+  const renamed = await apiJson("/api/me", {
+    ...jsonPost({ username: NEW_USERNAME.toUpperCase() }),
+    method: "PATCH",
+  });
+  check(
+    "a username can be changed",
+    renamed.status === 200 && renamed.body?.user?.username === NEW_USERNAME,
+    `${renamed.body?.user?.username} — uppercased input is lowercased`
+  );
+
+  const oldLink = await pageOf(`/u/${A.username}/p/${bbPost}`, { sessionToken: C.token, redirect: "manual" });
+  check(
+    "the old permalink now 404s — the reason /p/[postId] exists",
+    oldLink.status === 404,
+    `status ${oldLink.status}`
+  );
+  const stableLink = await pageOf(`/p/${bbPost}`, { sessionToken: C.token, redirect: "manual" });
+  check(
+    "the stable /p/[postId] link still resolves after a rename",
+    stableLink.status === 307 && stableLink.location.endsWith(`/u/${NEW_USERNAME}/p/${bbPost}`),
+    `status ${stableLink.status}, location ${stableLink.location}`
+  );
+  check(
+    "an unknown post id 404s there too",
+    (await pageOf("/p/clh0000000000000000000000", { sessionToken: C.token, redirect: "manual" })).status === 404
+  );
+
+  await apiJson("/api/me", { ...jsonPost({ username: A.username }), method: "PATCH" });
+  check(
+    "the original username is restored",
+    (await apiJson("/api/me")).body?.user?.username === A.username,
+    A.username
+  );
+
+  // ------------------------------------------- input caps and lookup rules
+  section("Input caps and lookup rules");
+
+  check(
+    "an over-long caption is rejected",
+    (
+      await apiJson(
+        "/api/posts",
+        jsonPost({ titleId: tvTitle.titleId, seasonNumber: 1, rating: 8, caption: "z".repeat(2001) })
+      )
+    ).status === 400
+  );
+  check(
+    "a 2000-character caption is accepted",
+    (
+      await apiJson(
+        "/api/posts",
+        jsonPost({ titleId: tvTitle.titleId, seasonNumber: 1, rating: 8, caption: "z".repeat(2000) })
+      )
+    ).status === 200
+  );
+
+  // Search is case-insensitive and profile URLs are lowercased, so sending a
+  // request by handle has to be too.
+  await db.query(
+    `DELETE FROM "Friendship" WHERE ("requesterId" = $1 AND "recipientId" = $2) OR ("requesterId" = $2 AND "recipientId" = $1)`,
+    [B.id, A.id]
+  );
+  const upperHandle = await apiJson("/api/friends/requests", {
+    ...jsonPost({ username: A.username.toUpperCase() }),
+    sessionToken: B.token,
+  });
+  check(
+    "a friend request resolves an uppercased username",
+    upperHandle.status === 201,
+    `status ${upperHandle.status}`
+  );
+  const upperRow = await db.query(
+    `SELECT id FROM "Friendship" WHERE "requesterId" = $1 AND "recipientId" = $2`,
+    [B.id, A.id]
+  );
+  check("…and lands on the right user", upperRow.rowCount === 1, `${upperRow.rowCount} rows`);
+
   // ------------------------------------------------------------- cleanup
   section("Cleanup");
   await cleanup(db, [A, B, C]);

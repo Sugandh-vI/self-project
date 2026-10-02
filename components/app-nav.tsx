@@ -12,6 +12,7 @@ import type { FriendsOverview } from "@/lib/friends";
 const LINKS = [
   { href: "/", label: "Search" },
   { href: "/feed", label: "Feed" },
+  { href: "/settings", label: "Settings" },
   { href: "/friends", label: "Friends" },
 ] as const;
 
