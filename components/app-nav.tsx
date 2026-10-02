@@ -68,7 +68,16 @@ export function AppNav() {
         </div>
 
         <div className="ml-auto flex items-center gap-3 text-sm">
-          <span className="text-muted-foreground">@{username ?? "…"}</span>
+          {username ? (
+            <Link
+              href={`/u/${username}`}
+              className="text-muted-foreground hover:underline"
+            >
+              @{username}
+            </Link>
+          ) : (
+            <span className="text-muted-foreground">…</span>
+          )}
           <Button
             variant="ghost"
             size="sm"

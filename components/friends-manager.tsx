@@ -105,6 +105,8 @@ export function FriendsManager({
     },
     onSuccess: async () => {
       setError(null);
+      // A relation change moves a user between search panels, so the search
+      // cache has to go stale with the friends list.
       await queryClient.invalidateQueries({ queryKey: ["friends"] });
       await queryClient.invalidateQueries({ queryKey: ["user-search"] });
     },

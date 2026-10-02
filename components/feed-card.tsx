@@ -8,6 +8,16 @@ import { formatRelativeTime } from "@/lib/utils";
 import type { FeedCard as FeedCardData, FeedEntry } from "@/lib/feed";
 
 /**
+ * Relative when we have a reference instant, otherwise the plain UTC date.
+ * The permalink page is a server component and cannot read the clock during
+ * render, and a locale-formatted date there would risk a hydration mismatch —
+ * `YYYY-MM-DD` is identical on both sides.
+ */
+function timeLabel(iso: string, now: number | null): string {
+  return now === null ? iso.slice(0, 10) : formatRelativeTime(iso, now);
+}
+
+/**
  * One card = one franchise group for one user (a standalone movie is just a
  * one-entry group). The carousel is swipeable inline, and the caption below it
  * follows the slide you are on.
@@ -33,11 +43,9 @@ export function FeedCard({ card, now }: { card: FeedCardData; now: number | null
               {handle}
             </Link>
           </p>
-          {now !== null && (
-            <p className="text-xs text-muted-foreground">
-              {formatRelativeTime(card.lastActivityAt, now)}
-            </p>
-          )}
+          <p className="text-xs text-muted-foreground">
+            {timeLabel(card.lastActivityAt, now)}
+          </p>
         </div>
 
         <div className="ml-auto flex shrink-0 gap-1.5 text-xs">
@@ -71,13 +79,11 @@ export function FeedCard({ card, now }: { card: FeedCardData; now: number | null
         <p className="mt-0.5 text-sm">
           <span className="font-semibold tabular-nums">{entry.rating}</span>
           <span className="text-muted-foreground">/10</span>
-          {now !== null && (
-            <span className="text-muted-foreground">
-              {" · "}
-              {formatRelativeTime(entry.createdAt, now)}
-              {entry.updatedAt > entry.createdAt && " · edited"}
-            </span>
-          )}
+          <span className="text-muted-foreground">
+            {" · "}
+            {timeLabel(entry.createdAt, now)}
+            {entry.updatedAt > entry.createdAt && " · edited"}
+          </span>
         </p>
         {entry.caption && (
           <p className="mt-2 whitespace-pre-wrap text-sm text-muted-foreground">

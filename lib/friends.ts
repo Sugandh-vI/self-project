@@ -119,6 +119,22 @@ export async function getRelation(
   return row.requesterId === viewerId ? "outgoing" : "incoming";
 }
 
+/**
+ * The row connecting two users, if any — used when a page needs the friendship
+ * id (accept / decline / cancel) rather than just the relation. Prefers an
+ * accepted row, matching getRelation.
+ */
+export async function getFriendshipBetween(
+  viewerId: string,
+  otherUserId: string
+): Promise<{ id: string; status: "pending" | "accepted"; requesterId: string } | null> {
+  return prisma.friendship.findFirst({
+    where: pairWhere(viewerId, otherUserId),
+    orderBy: { status: "asc" },
+    select: { id: true, status: true, requesterId: true },
+  });
+}
+
 /** Ids of everyone the user is friends with — the feed's membership filter. */
 export async function getFriendIds(userId: string): Promise<string[]> {
   const rows = await prisma.friendship.findMany({

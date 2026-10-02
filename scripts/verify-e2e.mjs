@@ -1080,6 +1080,222 @@ async function main() {
     `friendCount ${bFeed.body?.friendCount}`
   );
 
+  // ------------------------------------------------- profile + permalink
+  section("Profile: tile grid, permalink, private accounts");
+
+  /** Fetch a page and return its status + body text, so the checks can assert
+   *  on what a visitor would actually see. */
+  async function pageOf(path, { sessionToken = SESSION_TOKEN, ...rest } = {}) {
+    const res = await api(path, { sessionToken, ...rest });
+    return {
+      status: res.status,
+      location: res.headers.get("location") ?? "",
+      html: await res.text(),
+    };
+  }
+
+  // React separates adjacent text nodes with empty comments (`a<!-- --> · `);
+  // stripping them lets an assertion match the sentence a human reads.
+  const readable = (html) => html.replace(/<!--[\s\S]*?-->/g, "");
+
+  // --- /api/users/[username] ---------------------------------------------
+  const summaryAsC = await apiJson(`/api/users/${A.username}`, { sessionToken: C.token });
+  check("a friend can read the profile summary", summaryAsC.status === 200, `status ${summaryAsC.status}`);
+  check(
+    "the summary reports the relation, so the UI can pick the right button",
+    summaryAsC.body?.viewerRelation === "friends",
+    `${summaryAsC.body?.viewerRelation}`
+  );
+  check("canView is true for a friend", summaryAsC.body?.canView === true);
+  check(
+    "the summary carries no posts — the endpoint has no leak surface at all",
+    Boolean(summaryAsC.body) && !("posts" in summaryAsC.body) && !("groups" in summaryAsC.body)
+  );
+
+  const summaryUpper = await apiJson(`/api/users/${A.username.toUpperCase()}`, {
+    sessionToken: C.token,
+  });
+  check(
+    "usernames are case-insensitive to look up",
+    summaryUpper.status === 200 && summaryUpper.body?.user?.id === A.id,
+    `status ${summaryUpper.status}`
+  );
+
+  const summaryMissing = await apiJson("/api/users/definitely-not-a-real-user", {
+    sessionToken: C.token,
+  });
+  check("an unknown username is a 404", summaryMissing.status === 404, `status ${summaryMissing.status}`);
+
+  const summaryAnon = await api(`/api/users/${A.username}`, { sessionToken: "no-such-session-token" });
+  check("an anonymous profile read is rejected", summaryAnon.status === 401, `status ${summaryAnon.status}`);
+
+  // --- the grid: one tile per franchise, not one per entry ----------------
+  const groupCount = await db.query(
+    `SELECT COUNT(*)::int AS n FROM (
+       SELECT COALESCE('g:' || e."franchiseGroupId", 'p:' || p.id) AS k
+       FROM "Post" p JOIN "Entry" e ON e.id = p."entryId"
+       WHERE p."userId" = $1
+       GROUP BY 1
+     ) x`,
+    [A.id]
+  );
+  const expectedGroups = groupCount.rows[0].n;
+  const postCount = await db.query(`SELECT COUNT(*)::int AS n FROM "Post" WHERE "userId" = $1`, [A.id]);
+  check(
+    "the test user really does have a multi-entry franchise to collapse",
+    expectedGroups >= 1 && postCount.rows[0].n > expectedGroups,
+    `${postCount.rows[0].n} posts across ${expectedGroups} groups`
+  );
+
+  // A Set, not a raw count: the RSC flight payload repeats every href, and
+  // deduping keeps the assertion independent of that implementation detail.
+  const tileIdsOf = (html) =>
+    new Set(
+      [...html.matchAll(new RegExp(`href="/u/${A.username}/p/([A-Za-z0-9_-]+)"`, "g"))].map(
+        (m) => m[1]
+      )
+    );
+
+  const gridAsC = await pageOf(`/u/${A.username}`, { sessionToken: C.token });
+  check("a friend can open the profile grid", gridAsC.status === 200, `status ${gridAsC.status}`);
+  const tilesAsC = tileIdsOf(gridAsC.html);
+  check(
+    "the grid renders one tile per franchise, not one per entry",
+    tilesAsC.size === expectedGroups,
+    `${tilesAsC.size} tiles vs ${expectedGroups} groups`
+  );
+
+  // The canonical order is season asc (nulls last), then createdAt asc — the
+  // carousel on a profile has to start at slide 1, unlike a feed card, which
+  // opens on whatever bumped it.
+  const bbPosts = await db.query(
+    `SELECT p.id, e."seasonNumber" FROM "Post" p
+     JOIN "Entry" e ON e.id = p."entryId"
+     JOIN "FranchiseGroup" g ON g.id = e."franchiseGroupId"
+     WHERE p."userId" = $1 AND g.name = $2
+     ORDER BY e."seasonNumber" ASC NULLS LAST, p."createdAt" ASC`,
+    [A.id, "Breaking Bad"]
+  );
+  const firstBb = bbPosts.rows[0];
+  const lastBb = bbPosts.rows[bbPosts.rows.length - 1];
+  check(
+    "a franchise tile links to the group's first entry",
+    Boolean(firstBb) && tilesAsC.has(firstBb.id),
+    firstBb ? `season ${firstBb.seasonNumber}` : "no Breaking Bad posts"
+  );
+
+  const gridAsB = await pageOf(`/u/${A.username}`, { sessionToken: B.token });
+  check(
+    "a non-friend sees a public profile's grid too",
+    gridAsB.status === 200 && tileIdsOf(gridAsB.html).size === expectedGroups,
+    `status ${gridAsB.status}`
+  );
+
+  const gridAnon = await pageOf(`/u/${A.username}`, {
+    sessionToken: "no-such-session-token",
+    redirect: "manual",
+  });
+  check(
+    "an anonymous visit to a profile is sent to sign-in",
+    gridAnon.status === 307 && gridAnon.location.includes("/signin"),
+    `status ${gridAnon.status}, location ${gridAnon.location}`
+  );
+
+  const profileRedirect = await pageOf("/profile", { redirect: "manual" });
+  check(
+    "/profile redirects to your own canonical URL",
+    profileRedirect.status === 307 && profileRedirect.location.endsWith(`/u/${A.username}`),
+    `status ${profileRedirect.status}, location ${profileRedirect.location}`
+  );
+
+  // --- the permalink: every entry of the franchise, focused slide ---------
+  const permalinkAsC = await pageOf(`/u/${A.username}/p/${firstBb.id}`, { sessionToken: C.token });
+  check("a permalink opens", permalinkAsC.status === 200, `status ${permalinkAsC.status}`);
+  const permalinkText = readable(permalinkAsC.html);
+  check(
+    "the carousel carries the whole franchise, not just the linked entry",
+    bbPosts.rows.every((row) => permalinkText.includes(`Season ${row.seasonNumber}`)),
+    bbPosts.rows.map((row) => `S${row.seasonNumber}`).join(", ")
+  );
+  check(
+    "the permalink opens on the slide it names",
+    permalinkText.includes(`Breaking Bad · Season ${firstBb.seasonNumber}`),
+    `looked for 'Breaking Bad · Season ${firstBb.seasonNumber}'`
+  );
+
+  const permalinkLast = await pageOf(`/u/${A.username}/p/${lastBb.id}`, { sessionToken: C.token });
+  check(
+    "a different entry deep-links to its own slide",
+    permalinkLast.status === 200 &&
+      readable(permalinkLast.html).includes(`Breaking Bad · Season ${lastBb.seasonNumber}`),
+    `looked for 'Breaking Bad · Season ${lastBb.seasonNumber}'`
+  );
+
+  const permalinkWrongOwner = await pageOf(`/u/${C.username}/p/${firstBb.id}`, {
+    sessionToken: C.token,
+  });
+  check(
+    "a post under a username that does not own it is a 404",
+    permalinkWrongOwner.status === 404,
+    `status ${permalinkWrongOwner.status}`
+  );
+
+  const permalinkMissing = await pageOf(`/u/${A.username}/p/clh0000000000000000000000`, {
+    sessionToken: C.token,
+  });
+  check("an unknown post id is a 404", permalinkMissing.status === 404, `status ${permalinkMissing.status}`);
+
+  // --- the private profile ------------------------------------------------
+  // Set directly in the DB: there is no endpoint for it yet, and the check is
+  // about how the read paths behave, not about the toggle.
+  await db.query(`UPDATE "User" SET "isPrivate" = true WHERE id = $1`, [A.id]);
+
+  const privateSummaryB = await apiJson(`/api/users/${A.username}`, { sessionToken: B.token });
+  check(
+    "a private profile reports canView false to a non-friend",
+    privateSummaryB.status === 200 &&
+      privateSummaryB.body?.canView === false &&
+      privateSummaryB.body?.viewerRelation === "none",
+    `canView ${privateSummaryB.body?.canView}, relation ${privateSummaryB.body?.viewerRelation}`
+  );
+
+  const privateGridB = await pageOf(`/u/${A.username}`, { sessionToken: B.token });
+  check(
+    "the locked state is rendered instead of a grid",
+    privateGridB.status === 200 && readable(privateGridB.html).includes("This account is private."),
+    `status ${privateGridB.status}`
+  );
+  check(
+    "the locked profile sends no posts over HTTP",
+    tileIdsOf(privateGridB.html).size === 0,
+    `${tileIdsOf(privateGridB.html).size} tiles leaked`
+  );
+
+  const privatePermalinkB = await pageOf(`/u/${A.username}/p/${firstBb.id}`, {
+    sessionToken: B.token,
+  });
+  check(
+    "a private post is a 404 for a non-friend, not a locked page",
+    privatePermalinkB.status === 404,
+    `status ${privatePermalinkB.status} — a locked page here would confirm the post exists`
+  );
+
+  const privateGridC = await pageOf(`/u/${A.username}`, { sessionToken: C.token });
+  check(
+    "a friend still sees a private profile in full",
+    privateGridC.status === 200 && tileIdsOf(privateGridC.html).size === expectedGroups,
+    `status ${privateGridC.status}, ${tileIdsOf(privateGridC.html).size} tiles`
+  );
+
+  const privateFeedC = await feedOf(C.token, "?limit=30");
+  check(
+    "a private account still appears in its friends' feed",
+    (privateFeedC.body?.cards ?? []).some((card) => card.user.username === A.username),
+    `${privateFeedC.body?.cards?.length ?? 0} cards`
+  );
+
+  await db.query(`UPDATE "User" SET "isPrivate" = false WHERE id = $1`, [A.id]);
+
   // ------------------------------------------------------------- cleanup
   section("Cleanup");
   await cleanup(db, [A, B, C]);

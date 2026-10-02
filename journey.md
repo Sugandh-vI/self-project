@@ -1442,3 +1442,76 @@ cards open on the entry that caused the bump, snapshot pagination.
 Step 4: the profile — `/u/[username]` tile grid (newest activity first), the
 `/u/[username]/p/[postId]` carousel permalink (which the feed's "Open" links already point at),
 and the private-profile locked state, which is what finally consumes `lib/visibility.ts`.
+
+---
+
+## 2026-10-02 (session 5) — the profile grid and the permalink (step 4 of §15)
+
+The last piece of the friends-and-feed milestone. `lib/visibility.ts` was written back in step 1
+and had been waiting for a consumer ever since; this is the step that finally wires it in.
+
+### What was built
+
+- **`app/(app)/u/[username]/page.tsx`** — the Instagram-style tile grid. One square tile per
+  franchise group, newest activity first, each tile linking to the group's *first* entry.
+- **`app/(app)/u/[username]/p/[postId]/page.tsx`** — the carousel permalink. Same `FeedCard`
+  component the feed uses, so there is one rendering of a grouped card in the app, not two.
+- **`components/profile-grid.tsx`** — the tiles (server component, no client JS).
+- **`components/profile-actions.tsx`** — Add friend / Request sent + Cancel / Accept + Decline /
+  Friends + Remove, all through the existing `/api/friends/*` endpoints.
+- **`components/use-friend-action.ts`** — the friend-request mutation, shared with
+  `friends-manager.tsx` so both surfaces invalidate the same query keys.
+- **`app/api/users/[username]/route.ts`** — profile summary only: `{ user, viewerRelation,
+  canView }`.
+- **`app/(app)/profile/page.tsx`** — `/profile` means "me", so it redirects to your own
+  `/u/[username]` rather than keeping a second path that renders the same thing.
+- **`lib/feed.ts`** refactored: `loadGroupCards()` is now shared by the feed and the profile, and
+  `getProfileGroups()` + `getCardForPost()` are new read paths over it.
+
+### Decisions
+
+1. **The grid links to the group's first entry; a feed card links to whatever bumped it.** The
+   feed's card sets `focusEntryId` to the new season so a bumped card opens on the thing that
+   moved. A profile tile has no "thing that moved" — it opens at slide 1, which is what you want
+   when you tap Naruto and expect to swipe from the beginning. `getCardForPost` takes the opposite
+   default again: it sets `focusEntryId` to the entry in the URL, because that is the whole point
+   of a permalink.
+2. **A private post is a 404 for a non-friend, not a "locked" page.** Rendering "this post exists
+   but is private" would confirm the post's existence, which is itself a leak. The profile *page*
+   gets the locked state; a deep link to one of its posts does not.
+3. **`/api/users/[username]` returns no posts at all.** It answers "who is this and may I look?",
+   and nothing else. An endpoint that can't leak is easier to trust than one that can and
+   currently doesn't.
+4. **Visibility is checked before posts are ever fetched.** `loadProfileByUsername` does the lookup
+   and the visibility decision in one call, so no code path can render a profile without having
+   decided whether it is allowed to. On the permalink the ownership check and the visibility check
+   both have to pass.
+5. **The permalink shows a date, not a relative time.** It's a server component and can't read the
+   clock during render (`react-hooks/purity`), and a locale-formatted date risks a hydration
+   mismatch — so `YYYY-MM-DD`, identical on both sides. The feed gets relative times because it
+   measures them against the snapshot the server already sent.
+
+### Verification
+
+- `tsc`, `eslint` clean; `next build` compiles and the route table gains `/u/[username]`,
+  `/u/[username]/p/[postId]`, `/api/users/[username]` and `/profile`.
+- **`verify-e2e.mjs` extended with a live Profile section** (~25 checks): one tile per franchise
+  group and not one per entry (counted against a `GROUP BY` over the DB, deduped through a Set so
+  the RSC flight payload can't skew it); the tile links to the group's canonical first entry; a
+  public profile is visible to a non-friend while an anonymous visit is sent to sign-in; a
+  permalink carries the *whole* franchise and opens on the slide it names, and a different entry
+  deep-links to its own slide; a post under a username that doesn't own it is a 404; and the
+  private profile — `canView: false` to a non-friend, locked state rendered, **zero tiles in the
+  HTML**, post permalink 404s, a friend still sees everything, and a private account still shows up
+  in its friends' feed.
+- Tiles are counted from the HTML rather than the data layer on purpose: "the grid only renders one
+  link per group" is a claim about what a visitor receives, and the flight payload duplication is
+  exactly the kind of thing a data-layer test would miss.
+
+### What happens next
+
+Nothing is left in this milestone. Before starting the next one the design gets written up and
+signed off first — that's the standing gate. Also still outstanding from earlier: the dev
+credentials (Google OAuth client secret, Supabase DB password, `NEXTAUTH_SECRET`) need rotating
+before launch, and `journey.md` is still missing the ~355 lines that `ad07b34` added and a
+`--theirs` cherry-pick dropped.
