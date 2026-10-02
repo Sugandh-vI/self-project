@@ -1,8 +1,8 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import Image from "next/image";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Avatar } from "@/components/avatar";
 import { Button } from "@/components/ui/button";
 import type { FriendsOverview, PersonSummary } from "@/lib/friends";
 
@@ -297,7 +297,7 @@ function PersonRow({
 }) {
   return (
     <div className="flex items-center gap-3 rounded-lg border p-3">
-      <Avatar person={person} />
+      <Avatar user={person} />
       <div className="min-w-0">
         <p className="truncate text-sm font-medium">@{person.username}</p>
         {person.name && (
@@ -341,22 +341,3 @@ function PersonRow({
   );
 }
 
-function Avatar({ person }: { person: PersonSummary }) {
-  if (person.image) {
-    return (
-      <Image
-        src={person.image}
-        alt=""
-        width={36}
-        height={36}
-        className="h-9 w-9 rounded-full object-cover"
-        unoptimized
-      />
-    );
-  }
-  return (
-    <div className="flex h-9 w-9 items-center justify-center rounded-full bg-muted text-xs font-semibold uppercase">
-      {person.username?.slice(0, 1) ?? "?"}
-    </div>
-  );
-}

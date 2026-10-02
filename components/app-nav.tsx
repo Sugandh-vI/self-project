@@ -11,6 +11,7 @@ import type { FriendsOverview } from "@/lib/friends";
 // Routes are added here as they land, so the nav never links to a 404.
 const LINKS = [
   { href: "/", label: "Search" },
+  { href: "/feed", label: "Feed" },
   { href: "/friends", label: "Friends" },
 ] as const;
 

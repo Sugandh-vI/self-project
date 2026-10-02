@@ -1377,3 +1377,68 @@ while they sit on disk untracked; `--mixed` clears it — worth remembering, it 
   and confirmed by the user on the real database.**
 - `npm run verify:schema` → 39/39 (locally, and from a clean `npm ci`).
 - Outstanding: `npm run verify:e2e` on the user's machine, now with the token fix.
+
+---
+
+## 2026-10-01 (session 4, part 5) — feed implemented (step 3 of §15)
+
+Everything below is per the signed-off design (§12–§14): one card per franchise group, vertical
+cards with an inline swipeable carousel, average rating + entry count, earliest-entry poster,
+cards open on the entry that caused the bump, snapshot pagination.
+
+### What was built
+
+- **`lib/feed.ts`** — `getFriendFeed({ viewerId, snapshotAt, cursor, limit })`. The ordering pass
+  is a single parameterised `$queryRaw` grouped by
+  `COALESCE('g:' || franchiseGroupId, 'p:' || postId)` **and userId**, ordered by
+  `MAX(createdAt) DESC`, keyset-paginated with a row comparison in `HAVING`. It returns each
+  group's post ids via `array_agg`, and the second pass fetches those posts with ordinary typed
+  Prisma (a primary-key fetch — it cannot pull in another user's posts that share a franchise
+  group). Cards and averages are then assembled in TS.
+- **`GET /api/feed`** — first call returns `snapshotAt`; later calls pass `snapshot` + opaque
+  base64url `cursor` (`{lastActivityAt, groupKey}`). Malformed cursor → 400, no session → 401,
+  limit clamped to 30.
+- **`/feed`** — `app/(app)/feed/page.tsx` + `components/feed-list.tsx` (TanStack
+  `useInfiniteQuery`) + `components/feed-card.tsx` + `components/entry-carousel.tsx`
+  (CSS scroll-snap, no carousel library). "Feed" added to the nav.
+- **`components/avatar.tsx`** — extracted from the friends manager so both screens share it.
+- **`formatRelativeTime`** in `lib/utils.ts` and a `no-scrollbar` utility in `globals.css`.
+
+### Decisions made while implementing
+
+1. **Grouping is per (user, franchise).** Two users rating the same show get two cards — the SQL
+   groups on `(group_key, userId)`, not on the franchise alone.
+2. **`friendCount` is in the feed response**, so the UI can distinguish "you have no friends" from
+   "your friends haven't posted" without a second request (and without coupling the feed to the
+   nav's friends query).
+3. **Relative timestamps are measured against `snapshotAt`**, not a client clock. Reading
+   `Date.now()` during render trips `react-hooks/purity`, and `setState` in an effect trips
+   `react-hooks/set-state-in-effect`; the server already sends the instant the feed was computed,
+   which is both stable across renders and the moment the data was actually true.
+4. **Cover poster** is the earliest entry's poster; if that title has none, it falls forward to the
+   first poster that exists before using the README §3 placeholder.
+5. **"N seasons" vs "N entries"** on the count badge: seasons when every entry in the group has a
+   label, entries otherwise (a group mixing seasons and OVAs shouldn't claim "5 seasons").
+
+### Verification
+
+- **The raw SQL was validated against a real Postgres (PGlite) with seeded data — 12/12:** groups
+  are per user + franchise; three seasons collapse into one card whose `post_ids` are newest-first;
+  a standalone movie is its own card; two users in the same franchise get separate cards; a
+  non-friend's post never appears; an older snapshot excludes newer posts (and the group's
+  `MAX(createdAt)` correctly falls back to the next-newest entry); keyset page 2 continues without
+  overlap or gaps. The temp script was deleted after use.
+- `tsc`, `eslint`, `next build` clean; `/feed` and `/api/feed` in the route table.
+- **`verify-e2e.mjs` extended with a live Feed section** (~20 checks): card-per-franchise,
+  average to one decimal checked against the DB, newest-first ordering, **re-rating does not
+  reorder and does not move `lastActivityAt`** (but does change the average), **a new season bumps
+  the card to the top, grows it by one, and sets `focusEntryId` to the new entry**, a page pinned
+  to an older snapshot does not see newer activity while a fresh one does, cursor pagination
+  without repeats, malformed cursor → 400, unauthenticated → 401, your own posts never appear, a
+  non-friend sees nothing, and `friendCount` 0 for someone with no friends.
+
+### What happens next
+
+Step 4: the profile — `/u/[username]` tile grid (newest activity first), the
+`/u/[username]/p/[postId]` carousel permalink (which the feed's "Open" links already point at),
+and the private-profile locked state, which is what finally consumes `lib/visibility.ts`.

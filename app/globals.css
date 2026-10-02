@@ -118,3 +118,13 @@
     @apply bg-background text-foreground;
   }
 }
+
+/* Carousel tracks scroll horizontally; the bar just gets in the way of the
+   posters. Keyboard and touch scrolling still work — it is only hidden. */
+@utility no-scrollbar {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  &::-webkit-scrollbar {
+    display: none;
+  }
+}

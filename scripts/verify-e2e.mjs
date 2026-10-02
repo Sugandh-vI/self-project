@@ -902,6 +902,184 @@ async function main() {
     (byEmail.body?.results ?? []).map((r) => r.username).join(", ")
   );
 
+  // ------------------------------------------------------------------ feed
+  // A and C are friends (auto-accepted above). B is deliberately left as a
+  // non-friend, so the same data can prove exclusion.
+  section("Feed: grouped cards, bumping, snapshot pagination");
+
+  const feedOf = (token, query = "") =>
+    apiJson(`/api/feed${query}`, { sessionToken: token });
+
+  const cardKey = (card) => `${card.user.username}:${card.groupKey}`;
+  const findCard = (page, username, groupName) =>
+    (page?.cards ?? []).find(
+      (card) => card.user.username === username && card.groupName === groupName
+    );
+
+  const firstPage = await feedOf(C.token, "?limit=30");
+  check("friend's feed loads", firstPage.status === 200, `status ${firstPage.status}`);
+  const feed1 = firstPage.body ?? { cards: [], friendCount: -1 };
+  check(
+    "friendCount lets the UI tell 'no friends' from 'no posts'",
+    feed1.friendCount === 1,
+    `friendCount ${feed1.friendCount}`
+  );
+
+  const bbCard = findCard(feed1, A.username, "Breaking Bad");
+  check(
+    "a franchise's seasons collapse into ONE card",
+    Boolean(bbCard) && bbCard.entryCount >= 2,
+    bbCard ? `${bbCard.entryCount} entries` : "card missing"
+  );
+
+  const bbRatings = await db.query(
+    `SELECT p.rating FROM "Post" p
+     JOIN "Entry" e ON e.id = p."entryId"
+     JOIN "FranchiseGroup" g ON g.id = e."franchiseGroupId"
+     WHERE p."userId" = $1 AND g.name = $2`,
+    [A.id, "Breaking Bad"]
+  );
+  const expectedAverage =
+    Math.round(
+      (bbRatings.rows.reduce((sum, row) => sum + row.rating, 0) / bbRatings.rows.length) * 10
+    ) / 10;
+  check(
+    "the card's average matches its entries, to one decimal",
+    bbCard && Math.abs(bbCard.averageRating - expectedAverage) < 0.06,
+    `${bbCard?.averageRating} vs ${expectedAverage}`
+  );
+
+  const activityTimes = (feed1.cards ?? []).map((card) => Date.parse(card.lastActivityAt));
+  check(
+    "cards are ordered newest first",
+    activityTimes.every((t, i) => i === 0 || activityTimes[i - 1] >= t),
+    `${feed1.cards?.length ?? 0} cards`
+  );
+
+  const orderBefore = (feed1.cards ?? []).map(cardKey);
+
+  // Re-rating must NOT bump: createdAt is untouched by the upsert's update
+  // branch, so MAX(createdAt) for the group does not move.
+  const rerated = await apiJson(
+    "/api/posts",
+    jsonPost({ titleId: tvTitle.titleId, seasonNumber: 1, rating: 7 })
+  );
+  check("re-rating season 1 succeeds", rerated.status === 200, `status ${rerated.status}`);
+  const feed2 = (await feedOf(C.token, "?limit=30")).body;
+  check(
+    "re-rating does NOT reorder the feed",
+    JSON.stringify((feed2?.cards ?? []).map(cardKey)) === JSON.stringify(orderBefore),
+    "card order unchanged"
+  );
+  const bbAfterRerate = findCard(feed2, A.username, "Breaking Bad");
+  check(
+    "re-rating leaves the group's last activity untouched",
+    bbAfterRerate?.lastActivityAt === bbCard?.lastActivityAt,
+    `${bbAfterRerate?.lastActivityAt}`
+  );
+  check(
+    "re-rating does update the displayed average",
+    bbAfterRerate && Math.abs(bbAfterRerate.averageRating - bbCard.averageRating) > 0.001,
+    `${bbCard?.averageRating} -> ${bbAfterRerate?.averageRating}`
+  );
+
+  // A new season must bump, and the carousel must open on it.
+  const season3 = await apiJson(
+    "/api/posts",
+    jsonPost({ titleId: tvTitle.titleId, seasonNumber: 3, rating: 10 })
+  );
+  check("posting season 3 succeeds", season3.status === 200, `status ${season3.status}`);
+  const s3Entry = await db.query(
+    `SELECT e.id FROM "Entry" e JOIN "Post" p ON p."entryId" = e.id
+     WHERE p."userId" = $1 AND e."titleId" = $2 AND e."seasonNumber" = 3`,
+    [A.id, tvTitle.titleId]
+  );
+  const feed3 = (await feedOf(C.token, "?limit=30")).body;
+  const bbBumped = findCard(feed3, A.username, "Breaking Bad");
+  check(
+    "a new season bumps the franchise card to the top",
+    feed3?.cards?.[0] && cardKey(feed3.cards[0]) === cardKey(bbBumped),
+    feed3?.cards?.[0] ? cardKey(feed3.cards[0]) : "no cards"
+  );
+  check(
+    "the card gains the new entry",
+    bbBumped?.entryCount === (bbCard?.entryCount ?? 0) + 1,
+    `${bbCard?.entryCount} -> ${bbBumped?.entryCount}`
+  );
+  check(
+    "the carousel opens on the entry that caused the bump",
+    bbBumped?.focusEntryId === s3Entry.rows[0]?.id,
+    `${bbBumped?.focusEntryId}`
+  );
+
+  // Snapshot pagination: a page pinned to an older instant must not shift
+  // under new activity, and the cursor must not repeat or skip cards.
+  const snapPage = await feedOf(C.token, "?limit=30");
+  const snapshot = snapPage.body?.snapshotAt;
+  await apiJson("/api/posts", jsonPost({ titleId: tvTitle.titleId, seasonNumber: 4, rating: 6 }));
+  const pinned = (await feedOf(C.token, `?limit=30&snapshot=${encodeURIComponent(snapshot)}`)).body;
+  check(
+    "a page pinned to an older snapshot does not see newer activity",
+    !(pinned?.cards ?? []).some((card) =>
+      card.entries.some((entry) => entry.entryLabel === "Season 4")
+    ),
+    "Season 4 excluded"
+  );
+  const refreshed = (await feedOf(C.token, "?limit=30")).body;
+  check(
+    "a fresh request does see it",
+    (refreshed?.cards ?? []).some((card) =>
+      card.entries.some((entry) => entry.entryLabel === "Season 4")
+    ),
+    "Season 4 included"
+  );
+
+  const page1 = (await feedOf(C.token, "?limit=1")).body;
+  check("limit is honoured", page1?.cards?.length === 1, `${page1?.cards?.length} cards`);
+  check("a cursor comes back while there is more", Boolean(page1?.nextCursor));
+  const page2 = await feedOf(
+    C.token,
+    `?limit=1&snapshot=${encodeURIComponent(page1.snapshotAt)}&cursor=${encodeURIComponent(page1.nextCursor)}`
+  );
+  check("page 2 loads with snapshot + cursor", page2.status === 200, `status ${page2.status}`);
+  check(
+    "page 2 does not repeat page 1",
+    page2.body?.cards?.[0] && cardKey(page2.body.cards[0]) !== cardKey(page1.cards[0]),
+    `${cardKey(page1.cards[0])} then ${cardKey(page2.body?.cards?.[0] ?? {})}`
+  );
+  check("the snapshot is echoed unchanged", page2.body?.snapshotAt === page1.snapshotAt);
+
+  const badCursor = await feedOf(C.token, "?cursor=not-a-real-cursor");
+  check(
+    "a malformed cursor is rejected",
+    badCursor.status === 400 && badCursor.body?.code === "invalid_cursor",
+    `status ${badCursor.status} code ${badCursor.body?.code}`
+  );
+  const anonFeed = await feedOf("not-a-real-session-token");
+  check("an unauthenticated feed call is 401", anonFeed.status === 401, `status ${anonFeed.status}`);
+
+  // Your own posts never appear in your own feed; a non-friend sees none.
+  await apiJson(
+    "/api/posts",
+    { ...jsonPost({ titleId: tvTitle.titleId, seasonNumber: 1, rating: 5 }), sessionToken: C.token }
+  );
+  const feedAfterOwnPost = (await feedOf(C.token, "?limit=30")).body;
+  check(
+    "your own posts never appear in your feed",
+    (feedAfterOwnPost?.cards ?? []).every((card) => card.user.username !== C.username)
+  );
+
+  const bFeed = await feedOf(B.token);
+  check(
+    "a non-friend sees none of A's posts",
+    (bFeed.body?.cards ?? []).every((card) => card.user.username !== A.username)
+  );
+  check(
+    "a user with no friends reports friendCount 0",
+    bFeed.body?.friendCount === 0,
+    `friendCount ${bFeed.body?.friendCount}`
+  );
+
   // ------------------------------------------------------------- cleanup
   section("Cleanup");
   await cleanup(db, [A, B, C]);
