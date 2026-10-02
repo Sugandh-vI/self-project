@@ -205,10 +205,15 @@ async function connectDatabase() {
 }
 
 /** Creates a throwaway user + session row directly in the DB, so the API
- *  routes can be exercised without a Google login. */
-async function seedUser(db, email, username) {
+ *  routes can be exercised without a Google login. Pass an explicit `token`
+ *  when the caller needs to know the cookie in advance — the primary user must
+ *  be seeded with SESSION_TOKEN, because that is the cookie every request
+ *  sends. (Generating a token here instead once made every authed call 401 and
+ *  looked exactly like an app-wide auth regression.) */
+async function seedUser(db, email, username, token) {
   const id = `ve2e_${randomBytes(8).toString("hex")}`;
-  const token = `verify-e2e-${randomBytes(16).toString("hex")}`;
+  const sessionToken =
+    token ?? `verify-e2e-${randomBytes(16).toString("hex")}`;
   await db.query(
     `INSERT INTO "User" (id, email, username, "isPrivate", "createdAt")
      VALUES ($1, $2, $3, false, NOW())`,
@@ -217,9 +222,20 @@ async function seedUser(db, email, username) {
   await db.query(
     `INSERT INTO "Session" (id, "sessionToken", "userId", expires)
      VALUES ($1, $2, $3, NOW() + INTERVAL '1 day')`,
-    [`ve2e_s_${randomBytes(8).toString("hex")}`, token, id]
+    [`ve2e_s_${randomBytes(8).toString("hex")}`, sessionToken, id]
   );
-  return { id, token, username, email };
+  return { id, token: sessionToken, username, email };
+}
+
+/** Removes the throwaway users and everything hanging off them. A function so
+ *  the early-exit paths can clean up too, instead of leaking test users. */
+async function cleanup(db, users) {
+  for (const u of users) {
+    await db.query(`DELETE FROM "Friendship" WHERE "requesterId" = $1 OR "recipientId" = $1`, [u.id]);
+    await db.query(`DELETE FROM "Post" WHERE "userId" = $1`, [u.id]);
+    await db.query(`DELETE FROM "Session" WHERE "userId" = $1`, [u.id]);
+    await db.query(`DELETE FROM "User" WHERE id = $1`, [u.id]);
+  }
 }
 
 async function main() {
@@ -245,29 +261,62 @@ async function main() {
 
   // `userId` below is A; SESSION_TOKEN is A's cookie, so every pre-existing
   // check keeps working unchanged.
-  const A = await seedUser(db, TEST_EMAIL, "verify_e2e");
+  // A gets SESSION_TOKEN: that is the cookie `api()` sends by default.
+  const A = await seedUser(db, TEST_EMAIL, "verify_e2e", SESSION_TOKEN);
   const userId = A.id;
   const B = await seedUser(db, TEST_EMAILS[1], "friend_b");
   const C = await seedUser(db, TEST_EMAILS[2], "friend_c");
   console.log(`  seeded users: ${A.username}, ${B.username}, ${C.username}`);
 
-  // Sanity: is the dev server reachable and does our session work?
+  // Prove the cookie this harness sends actually resolves to a session row.
+  // Without this, a token mismatch surfaces as 401s on every authed call and
+  // reads as an app-wide auth regression rather than a seeding mistake.
+  const sessionProbe = await db.query(
+    `SELECT u.username FROM "Session" s JOIN "User" u ON u.id = s."userId"
+     WHERE s."sessionToken" = $1 AND s.expires > NOW()`,
+    [SESSION_TOKEN]
+  );
+  check(
+    "the cookie this harness sends resolves to an unexpired session",
+    sessionProbe.rows.length === 1,
+    sessionProbe.rows[0]?.username ??
+      `no row for token ${SESSION_TOKEN.slice(0, 22)}…`
+  );
+
+  // Sanity: is the dev server reachable and does our session work? A failure
+  // here cascades into every later check (and once produced a crash three
+  // sections later), so diagnose it here and stop.
   let probe;
   try {
     probe = await apiJson("/api/search?category=movie&q=probe");
   } catch {
     console.error(
-      `Could not reach ${BASE_URL} — is the dev server running? Start it with: npm run dev`
+      `\nCould not reach ${BASE_URL} — is the dev server running? Start it with: npm run dev`
     );
+    await cleanup(db, [A, B, C]);
     await db.end();
     process.exit(1);
   }
+
   if (probe.status === 401 && cookieName === "next-auth.session-token") {
     cookieName = "__Secure-next-auth.session-token";
-    const retry = await apiJson("/api/search?category=movie&q=probe");
-    check("dev server reachable + session cookie accepted", retry.status === 200, `status ${retry.status}`);
-  } else {
-    check("dev server reachable + session cookie accepted", probe.status === 200, `status ${probe.status}`);
+    probe = await apiJson("/api/search?category=movie&q=probe");
+  }
+
+  check("dev server reachable + session cookie accepted", probe.status === 200, `status ${probe.status}`);
+
+  if (probe.status !== 200) {
+    console.error(
+      `\nThe dev server rejected the harness session cookie (status ${probe.status}).\n` +
+        "Nothing after this point is meaningful. Most likely causes, in order:\n" +
+        "  1. The seeded Session row does not match the cookie — see the setup check above.\n" +
+        "  2. NEXTAUTH_SECRET in .env is not the secret the running dev server loaded\n" +
+        "     (restart `npm run dev` after editing .env).\n" +
+        `  3. NEXTAUTH_URL in .env does not match ${BASE_URL}.`
+    );
+    await cleanup(db, [A, B, C]);
+    await db.end();
+    process.exit(1);
   }
 
   // ------------------------------------------------- schema: friends indexes
@@ -855,12 +904,7 @@ async function main() {
 
   // ------------------------------------------------------------- cleanup
   section("Cleanup");
-  for (const u of [A, B, C]) {
-    await db.query(`DELETE FROM "Friendship" WHERE "requesterId" = $1 OR "recipientId" = $1`, [u.id]);
-    await db.query(`DELETE FROM "Post" WHERE "userId" = $1`, [u.id]);
-    await db.query(`DELETE FROM "Session" WHERE "userId" = $1`, [u.id]);
-    await db.query(`DELETE FROM "User" WHERE id = $1`, [u.id]);
-  }
+  await cleanup(db, [A, B, C]);
   console.log("  removed test users, sessions and posts (cache rows intentionally kept)");
   await db.end();
 
